@@ -90,11 +90,18 @@
 /// base classes + thin core, core direct members 49→16, member/method names and public surface unchanged, round-59);
 /// 0.46.5 = WindowImpl destruction-order invariant documented (ARCH60-02) + the nine base classes' impl()
 /// demoted to protected (IFACE60-01 encapsulation narrowing, no external call sites inside detail,
-/// public surface unchanged, round-61; REG60-01 erratum: the thin core's direct member declaration-line count is 19, not 16).
+/// public surface unchanged, round-61; REG60-01 erratum: the thin core's direct member declaration-line count is 19, not 16);
+/// 0.47.0 = entry-table completion round (round-62): Menu/MenuBar/ToolBar/StatusBar/CommandBar/
+/// NavigationView/TreeView gain Clear() (API62-01), CommandBar gains SetItemText/EnableItem
+/// (API62-03), TreeView::Node::expanded made private behind IsExpanded() + TreeView::SetNodeText
+/// (API62-02), Label ellipsis truncation de-allocated via binary search (PERF62-01, rendering-identical);
+/// 0.47.1 = caption-button hover/press highlight extends up to the title bar's top edge (round-64:
+/// the system highlight box is taller than its hit box and touches the window top, R32-06/M-05;
+/// hit geometry unchanged, paint-only).
 #define SLENDER_UI_VERSION_MAJOR 0
-#define SLENDER_UI_VERSION_MINOR 46
-#define SLENDER_UI_VERSION_PATCH 5
-#define SLENDER_UI_VERSION "0.46.5"
+#define SLENDER_UI_VERSION_MINOR 47
+#define SLENDER_UI_VERSION_PATCH 1
+#define SLENDER_UI_VERSION "0.47.1"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
@@ -760,6 +767,9 @@ private:
     bool wrap_ = false;
     float cornerRadius_ = 8.0f;
     bool ellipsis_ = false;
+    // ellipsis draw-string scratch (PERF62-01): a local std::wstring here exceeded SSO on every
+    // paint of an overflowing label; a member reuses its capacity across frames (PERF57-01 pattern)
+    std::wstring ellipsisScratch_;
 };
 
 /// Button style variants (maps to the demo library: standard/accent/subtle/outline/hyperlink/icon button).
@@ -1051,6 +1061,10 @@ public:
     Menu& AddCheckItem(std::wstring_view text, bool checked,
                        std::function<void()> onClick);
 
+    /// Removes all items (API62-01, round-62): one Menu object becomes reusable across shows.
+    /// Popups already open hold their own copies (ShowContextMenu/AddMenuButton copy), unaffected; MenuBar popups instead reference the Menu live (raw pointer), so Clear() on a Menu returned by MenuBar::AddMenu while its popup is open blanks that popup (stale geometry, empty list) until closed.
+    void Clear();
+
     /// Marks the previously added item disabled (chainable: AddItem(...).Disabled()).
     Menu& Disabled();
 
@@ -1089,6 +1103,9 @@ public:
 
     /// Adds a dropdown menu; the returned reference can be further filled with AddItem/AddSeparator/AddCheckItem.
     Menu& AddMenu(std::wstring_view title);
+
+    /// Removes all menus and closes an open popup (API62-01, round-62).
+    void Clear();
 
 protected:
     float DockHeight() const override;
@@ -1147,6 +1164,9 @@ public:
     /// Enables/disables an item (disabled renders gray and ignores clicks).
     ToolBar& EnableItem(int index, bool enabled);
 
+    /// Removes all items (API62-01, round-62); hover/pressed state reset.
+    void Clear();
+
 protected:
     float DockHeight() const override;
 
@@ -1190,6 +1210,9 @@ public:
 
     /// Shows an accent-colored dot before a segment's text (e.g. a "Ready" status indicator).
     StatusBar& SetSectionDot(int index, bool dot);
+
+    /// Removes all segments (API62-01, round-62); later AddSection calls re-index from 0.
+    void Clear();
 
 protected:
     float DockHeight() const override;
@@ -1854,11 +1877,16 @@ public:
         std::optional<Color> iconColor;   // if unset, color chosen by row kind: leaf textSecondary,
                                           // summary text (baseline .tree .leaf{color:var(--text2)}
                                           // via currentColor inheritance, R25-02; C-10 comment erratum)
-        bool expanded = false;
         std::function<void()> onClick;
+
+        /// Expansion state, read-only (API62-02, round-62): the field is private because a direct
+        /// write never rebuilt rows_ — children silently failed to show/hide with no diagnostic.
+        /// Writes go through TreeView::SetExpanded.
+        bool IsExpanded() const { return expanded_; }
 
     private:
         friend class TreeView;
+        bool expanded_ = false;
         std::vector<std::unique_ptr<Node>> children;
         Node* parent = nullptr;
     };
@@ -1866,6 +1894,15 @@ public:
     Node& AddRoot(std::wstring_view text, const Icon& icon = {});
     Node& AddChild(Node& parent, std::wstring_view text, const Icon& icon = {});
     TreeView& SetExpanded(Node& node, bool expanded);
+
+    /// Updates a node's label through the library (API62-02, round-62). Direct writes to
+    /// Node::text remain possible (deliberately kept public) but neither invalidate layout nor
+    /// repaint — this is the entry point that takes effect immediately.
+    TreeView& SetNodeText(Node& node, std::wstring_view text);
+
+    /// Removes all roots (API62-01, round-62); hover and keyboard-focus row reset. Nodes are owned
+    /// (unique_ptr), so their references must not be used after this call.
+    void Clear();
 
     std::function<void(Node&)> OnClick;
 
@@ -2098,6 +2135,19 @@ public:
     /// minW: per-item minimum width override (baseline "More" min-width:44px; default 58).
     CommandBar& AddMenuButton(const Icon& icon, std::wstring_view label, Menu& menu,
                               float minW = 0.0f);
+
+    /// Updates an item's label (API62-03, round-62; separators/spacers ignore it — same
+    /// contract as ToolBar::SetItemText).
+    CommandBar& SetItemText(int index, std::wstring_view text);
+
+    /// Enables/disables an item (API62-03, round-62 — same contract as ToolBar::EnableItem):
+    /// disabled renders gray, shows no hover/press feedback, ignores clicks and keyboard
+    /// activation, and is skipped by the left/right focus walk.
+    CommandBar& EnableItem(int index, bool enabled);
+
+    /// Removes all items (API62-01, round-62); hover/pressed/keyboard-focus reset. A flyout
+    /// already opened by an item is window-owned and dismisses on its own.
+    void Clear();
     void CollectText(std::wstring& out) const override {
         for (const auto& it : items_)
             if (!it.separator && !it.space) { out += it.label; out += L' '; }
@@ -2121,6 +2171,7 @@ private:
         bool separator = false;
         bool space = false;
         bool menu = false;
+        bool enabled = true;   // API62-03: same disabled semantics as ToolBar items
         Icon icon;
         std::wstring label;
         std::function<void()> onClick;
@@ -2311,6 +2362,10 @@ public:
     /// Adds a nav item, returns the index.
     int AddItem(const Icon& icon, std::wstring_view text,
                 std::function<void(size_t)> onClick = {});
+
+    /// Removes all groups/items (API62-01, round-62); selection, hover, keyboard focus and
+    /// scroll offset reset. Indices from later AddItem calls start over at 0.
+    void Clear();
 
     int SelectedIndex() const { return selected_; }
     /// Programmatically selects a nav item. Default is no notify (same convention as Slider/ComboBox/ListView/RatingControl,
@@ -7505,7 +7560,13 @@ void TitleBar::OnPaint(Painter& p, const Theme& theme) {
                                        : theme.captionPressed;
         else if (hovered) fill = close ? theme.captionCloseHover
                                        : theme.hoverSoft;
-        if (pressed || hovered) p.FillRect(r, fill);
+        // hover/press fill extends from the window's top edge down to the hit box bottom (round-64):
+        // the real Win11 highlight box is taller than its hit box and its top edge touches the window
+        // top (R32-06 measurement, M-05) -- filling only the hit box reads as a floating box with a
+        // strip of bare title background above it. Hit geometry stays as registered in the trade-off
+        // table (docs/项目约定.md, round-32 R32-06 registration).
+        if (pressed || hovered)
+            p.FillRect({ r.x, bounds_.y, r.w, r.Bottom() - bounds_.y }, fill);
         Color iconColor = (pressed || hovered) && close
                               ? theme.textOnAccent : dim(theme.titleText);
         // glyph drawing area 16 DIP (R32-08: the original 11 DIP left ink at ~2/3 of the system's;
@@ -8224,18 +8285,28 @@ void Label::OnPaint(Painter& p, const Theme& theme) {
         if (!centered) content = { content.x + iconSize_ + 6.0f, content.y,
                                    std::max(0.0f, content.w - iconSize_ - 6.0f), content.h };
     }
-    // ellipsis truncation: when text exceeds the content area, shrink glyph by glyph (text-overflow:ellipsis approximation)
-    std::wstring draw;
+    // ellipsis truncation: when text exceeds the content area, binary-search the longest fitting
+    // prefix (text-overflow:ellipsis approximation). The prefix advance width is monotone
+    // non-decreasing in length, so the largest passing n found here is identical to the linear
+    // scan this replaces — but with O(log N) instead of O(N) cache lookups, and measuring through
+    // a wstring_view instead of substr removes the per-step string copy entirely (PERF62-01:
+    // the old loop was a per-frame O(N²)-copy / O(N)-allocation path on any overflowing label).
+    std::wstring& draw = ellipsisScratch_;
     bool clipped = false;
     if (ellipsis_ && !wrap_ && content.w > 0 &&
         detail::MeasureTextWidth(text_, font_) > content.w) {
         clipped = true;
         const float dotsW = detail::MeasureTextWidth(L"…", font_);
-        size_t n = text_.size();
-        while (n > 0 && detail::MeasureTextWidth(text_.substr(0, n), font_) + dotsW >
-                            content.w) --n;
-        draw = text_.substr(0, n);
-        if (n > 0) draw += L"…";
+        size_t lo = 0, hi = text_.size();   // invariant: P(lo) assumed, P(hi+1..) rejected
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo + 1) / 2;
+            if (detail::MeasureTextWidth(std::wstring_view(text_.data(), mid), font_) + dotsW <=
+                content.w) lo = mid;
+            else hi = mid - 1;
+        }
+        draw.assign(text_.data(), lo);   // assign (not resize+copy) also clears stale scratch
+        if (lo > 0) draw += L"…";
+        // lo == 0 (the ellipsis alone does not fit) draws nothing, same as the old n == 0 branch
     }
     if (clipped) p.DrawText(draw, font_, content, color, hAlign_, vAlign_, wrap_);
     else p.DrawText(text_, font_, content, color, hAlign_, vAlign_, wrap_);
@@ -10181,12 +10252,28 @@ TreeView::Node& TreeView::AddChild(Node& parent, std::wstring_view text,
 }
 
 TreeView& TreeView::SetExpanded(Node& node, bool expanded) {
-    node.expanded = expanded;
+    node.expanded_ = expanded;
     rowsDirty_ = true;
     Relayout();
     Invalidate();
 
     return *this;
+}
+
+TreeView& TreeView::SetNodeText(Node& node, std::wstring_view text) {
+    node.text.assign(text.begin(), text.end());
+    // row heights are text-independent (leaf 30 / summary 32), so a repaint suffices
+    Invalidate();
+
+    return *this;
+}
+
+void TreeView::Clear() {
+    roots_.clear();
+    rowsDirty_ = true;
+    hover_ = keyRow_ = -1;
+    Relayout();
+    Invalidate();
 }
 
 void TreeView::RebuildRows() const {
@@ -10196,7 +10283,7 @@ void TreeView::RebuildRows() const {
             for (const auto& n : nodes) {
                 bool leaf = n->children.empty();
                 rows_.push_back({ n.get(), depth, leaf });
-                if (!leaf && n->expanded) walk(n->children, depth + 1);
+                if (!leaf && n->expanded_) walk(n->children, depth + 1);
             }
         };
     walk(roots_, 0);
@@ -10261,7 +10348,7 @@ void TreeView::OnPaint(Painter& p, const Theme& theme) {
         float indent = 8.0f + 25.0f * depth;
         if (!r.leaf) {
             Rect chev{ bounds_.x + indent, y + (rh - 16.0f) / 2.0f, 16, 16 };
-            p.DrawIcon(r.node->expanded ? kChevD : kChevR, chev, theme.textTertiary);
+            p.DrawIcon(r.node->expanded_ ? kChevD : kChevR, chev, theme.textTertiary);
         }
         float iconX = bounds_.x + indent + (r.leaf ? 0.0f : 24.0f);
         float textX = iconX;
@@ -10306,7 +10393,7 @@ void TreeView::OnMouseUp(const Point& pos) {
     Node* node = rows_[row].node;
     if (!rows_[row].leaf) {
         // baseline <summary>: the whole row toggles expand/collapse (L-03; hit step matches drawing, 25/level, L-02)
-        node->expanded = !node->expanded;
+        node->expanded_ = !node->expanded_;
         rowsDirty_ = true;
         Relayout();
         Invalidate();
@@ -10324,7 +10411,7 @@ void TreeView::OnKeydown(uint32_t vk) {
         if (row < 0 || row > last) return;
         Node* node = rows_[row].node;
         if (!rows_[row].leaf) {
-            node->expanded = !node->expanded;
+            node->expanded_ = !node->expanded_;
             rowsDirty_ = true;
             Relayout();
         }
@@ -10343,8 +10430,8 @@ void TreeView::OnKeydown(uint32_t vk) {
         break;
     case VK_RIGHT:
         if (keyRow_ < 0) break;
-        if (!rows_[keyRow_].leaf && !rows_[keyRow_].node->expanded) {
-            rows_[keyRow_].node->expanded = true;   // expanding does not change its own row number
+        if (!rows_[keyRow_].leaf && !rows_[keyRow_].node->expanded_) {
+            rows_[keyRow_].node->expanded_ = true;   // expanding does not change its own row number
             rowsDirty_ = true;
             Relayout();
             Invalidate();
@@ -10355,8 +10442,8 @@ void TreeView::OnKeydown(uint32_t vk) {
         break;
     case VK_LEFT:
         if (keyRow_ < 0) break;
-        if (!rows_[keyRow_].leaf && rows_[keyRow_].node->expanded) {
-            rows_[keyRow_].node->expanded = false;  // collapsing does not change its own row number
+        if (!rows_[keyRow_].leaf && rows_[keyRow_].node->expanded_) {
+            rows_[keyRow_].node->expanded_ = false;  // collapsing does not change its own row number
             rowsDirty_ = true;
             Relayout();
         } else if (rows_[keyRow_].node->parent) {
@@ -11022,6 +11109,32 @@ CommandBar& CommandBar::AddMenuButton(const Icon& icon, std::wstring_view label,
     return *this;
 }
 
+CommandBar& CommandBar::SetItemText(int index, std::wstring_view text) {
+    if (index < 0 || index >= static_cast<int>(items_.size())) return *this;
+    auto& item = items_[index];
+    if (item.separator || item.space) return *this;
+    item.label.assign(text.begin(), text.end());
+    itemsDirty_ = true;   // label width feeds the item rects
+    Invalidate();
+
+    return *this;
+}
+
+CommandBar& CommandBar::EnableItem(int index, bool enabled) {
+    if (index < 0 || index >= static_cast<int>(items_.size())) return *this;
+    items_[index].enabled = enabled;
+    Invalidate();
+    return *this;
+}
+
+void CommandBar::Clear() {
+    items_.clear();
+    itemsDirty_ = true;
+    hover_ = pressed_ = keyFocus_ = -1;
+    Relayout();
+    Invalidate();
+}
+
 void CommandBar::LayoutItems() const {
     // width-change self-invalidation (Widget::SetBounds is non-virtual and SetBounds does not mark dirty ⇒ after rescaling
     // the right group and second divider stayed at old positions, L-01)
@@ -11063,7 +11176,10 @@ int CommandBar::ItemAt(const Point& local) const {
     LayoutItems();
     for (int i = 0; i < static_cast<int>(items_.size()); ++i) {
         const auto& item = items_[i];
-        if (!item.separator && !item.space && item.rect.Contains(local.x, local.y))
+        // disabled items are un-hittable (API62-03, same as ToolBar::ItemAt): hover, press and
+        // release all route through here, so filtering once covers the whole pointer path
+        if (!item.separator && !item.space && item.enabled &&
+            item.rect.Contains(local.x, local.y))
             return i;
     }
     return -1;
@@ -11096,22 +11212,26 @@ void CommandBar::OnPaint(Painter& p, const Theme& theme) {
             continue;
         }
         if (item.space) continue;
+        bool disabled = !item.enabled;   // API62-03: pressed_/hover_ can never hold a disabled
+                                         // index (ItemAt filters), only keyFocus_ possibly can
         if (i == pressed_)
             p.FillRoundedRect(abs, 4, theme.subtleActive);
         else if (i == hover_)
             p.FillRoundedRect(abs, 4, theme.hoverSoft);
         // icons stay textSecondary (the baseline only recolors item backgrounds, never icons);
-        // content 18+3+17 is vertically centered in the 48 line box: icon top +5, label box +26 (B-14)
+        // content 18+3+17 is vertically centered in the 48 line box: icon top +5, label box +26 (B-14).
+        // disabled items gray both glyph layers, same convention as ToolBar
         p.DrawIcon(item.icon, { abs.x + (abs.w - 18.0f) / 2.0f, abs.y + 5, 18, 18 },
-                   theme.textSecondary);
+                   disabled ? theme.textDisabled : theme.textSecondary);
         p.DrawText(item.label, Font{ .size = 11.5f },
-                   { abs.x, abs.y + 26, abs.w, 16 }, theme.text,
+                   { abs.x, abs.y + 26, abs.w, 16 },
+                   disabled ? theme.textDisabled : theme.text,
                    HAlign::Center, VAlign::Center);
         // GAP38-03: keyboard focus ring; when focused-but-not-moved the ring lands on the first activatable item
         // (same convention as the Tabs/Expander composite widgets)
         bool firstActivatable = keyFocus_ < 0 &&
             std::none_of(items_.begin(), items_.begin() + i, [](const Item& it) {
-                return !it.separator && !it.space;
+                return !it.separator && !it.space && it.enabled;
             });
         if ((i == keyFocus_ || firstActivatable) &&
             Focused() && detail::g_focusFromKeyboard)
@@ -11190,7 +11310,8 @@ void CommandBar::OnKeydown(uint32_t vk) {
     if (vk == VK_LEFT || vk == VK_RIGHT) {
         std::vector<int> sel;
         for (int i = 0; i < n; ++i)
-            if (!items_[i].separator && !items_[i].space) sel.push_back(i);
+            if (!items_[i].separator && !items_[i].space && items_[i].enabled)
+                sel.push_back(i);   // API62-03: the focus walk skips disabled items
         if (sel.empty()) return;
         int pos = 0;
         if (keyFocus_ >= 0) {
@@ -11204,6 +11325,7 @@ void CommandBar::OnKeydown(uint32_t vk) {
     } else if (vk == VK_RETURN || vk == VK_SPACE) {
         if (keyFocus_ < 0) return;
         const Item& item = items_[keyFocus_];
+        if (!item.enabled) return;   // item disabled after it was focused: no activation
         if (item.menu) OpenItemMenu(item);
         else if (item.onClick) item.onClick();
     }
@@ -11717,6 +11839,17 @@ int NavigationView::AddItem(const Icon& icon, std::wstring_view text,
     return static_cast<int>(onClicks_.size()) - 1;
 }
 
+void NavigationView::Clear() {
+    entries_.clear();
+    onClicks_.clear();
+    selected_ = hover_ = keyFocus_ = -1;
+    scrollOffset_ = 0;
+    thumbDrag_ = thumbHover_ = false;
+    entriesDirty_ = true;
+    Relayout();
+    Invalidate();
+}
+
 NavigationView& NavigationView::SetSelectedIndex(int index, bool notify) {
     // OBS53-01: same "reject out-of-range" contract as the same-signature ComboBox/ListView/Tabs
     // (-1 = no selection); previously wrote without clamping, and SelectedIndex() could return a value with no matching item
@@ -12064,6 +12197,10 @@ Menu& Menu::AddCheckItem(std::wstring_view text, bool checked,
     return *this;
 }
 
+void Menu::Clear() {
+    items_.clear();
+}
+
 MenuBar::~MenuBar() {
     CloseMenu();
 }
@@ -12078,6 +12215,14 @@ Menu& MenuBar::AddMenu(std::wstring_view title) {
     titlesDirty_ = true;
     Invalidate();
     return ref;
+}
+
+void MenuBar::Clear() {
+    CloseMenu();   // collapses an open popup; resets open_/hover_ when one was open
+    hover_ = -1;
+    menus_.clear();
+    titlesDirty_ = true;
+    Invalidate();
 }
 
 void MenuBar::LayoutTitles() const {
@@ -12264,6 +12409,14 @@ ToolBar& ToolBar::EnableItem(int index, bool enabled) {
     return *this;
 }
 
+void ToolBar::Clear() {
+    items_.clear();
+    hover_ = pressed_ = -1;
+    itemsDirty_ = true;
+    Relayout();
+    Invalidate();
+}
+
 void ToolBar::LayoutItems() const {
     if (!itemsDirty_) return;
     const Font font{ .size = 13.0f };
@@ -12441,6 +12594,11 @@ StatusBar& StatusBar::SetSectionDot(int index, bool dot) {
 std::wstring StatusBar::SectionText(int index) const {
     if (index < 0 || index >= static_cast<int>(sections_.size())) return {};
     return sections_[index].text;
+}
+
+void StatusBar::Clear() {
+    sections_.clear();
+    Invalidate();
 }
 
 void StatusBar::OnPaint(Painter& p, const Theme& theme) {
