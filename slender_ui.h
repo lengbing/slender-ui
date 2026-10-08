@@ -68,6 +68,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 /// Library version (API-13): semantic major/minor/patch numbers plus a combined string, for consumers to do
 /// compile-time version checks and compatibility branching. Bumped on public API changes (API39-02): 0.38.0 =
@@ -97,11 +98,15 @@
 /// (API62-02), Label ellipsis truncation de-allocated via binary search (PERF62-01, rendering-identical);
 /// 0.47.1 = caption-button hover/press highlight extends up to the title bar's top edge (round-64:
 /// the system highlight box is taller than its hit box and touches the window top, R32-06/M-05;
-/// hit geometry unchanged, paint-only).
+/// hit geometry unchanged, paint-only);
+/// 0.48.0 = consumer-requirement capability round (round-65): title-bar control handover
+/// (Window::GetTitleBar + TitleBar badge/system-button configuration + custom caption buttons with
+/// toggle state and per-button tooltips, R1), Window::Hide (R2.1), Window::SetTopmost/IsTopmost
+/// (R2.2), Window::SetMaximizable full-path maximize suppression (R2.3).
 #define SLENDER_UI_VERSION_MAJOR 0
-#define SLENDER_UI_VERSION_MINOR 47
-#define SLENDER_UI_VERSION_PATCH 1
-#define SLENDER_UI_VERSION "0.47.1"
+#define SLENDER_UI_VERSION_MINOR 48
+#define SLENDER_UI_VERSION_PATCH 0
+#define SLENDER_UI_VERSION "0.48.0"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
@@ -1007,17 +1012,80 @@ private:
 // Title bar
 // ---------------------------------------------------------------------------
 
+/// Which built-in system buttons the title bar shows (bitwise OR-able; round-65 R1).
+/// Visibility only — the maximize *behavior* (Win+Up, caption double-click, Aero Snap,
+/// system-menu entry) is governed independently by Window::SetMaximizable.
+enum class WindowButtons : unsigned {
+    None     = 0,
+    Minimize = 1 << 0,
+    Maximize = 1 << 1,
+    Close    = 1 << 2,
+    Default  = Minimize | Maximize | Close,
+};
+
+constexpr WindowButtons operator|(WindowButtons a, WindowButtons b) {
+    return static_cast<WindowButtons>(static_cast<unsigned>(a) |
+                                      static_cast<unsigned>(b));
+}
+constexpr WindowButtons operator&(WindowButtons a, WindowButtons b) {
+    return static_cast<WindowButtons>(static_cast<unsigned>(a) &
+                                      static_cast<unsigned>(b));
+}
+constexpr bool HasWindowButton(WindowButtons buttons, WindowButtons flag) {
+    return (static_cast<unsigned>(buttons) & static_cast<unsigned>(flag)) != 0;
+}
+
 /// Owner-drawn title bar (created and docked at the very top automatically by the window): app badge, window title, and
-/// minimize/maximize/close buttons. Apps need not and should not create or lay out this widget manually.
+/// minimize/maximize/close buttons. Apps need not and should not create or lay out this widget manually; they configure it
+/// through Window::GetTitleBar() (round-65 R1): badge visibility, the system-button set, custom caption buttons (with
+/// toggle state and per-button tooltips), and a right-click takeover via the inherited OnContextMenuCb.
 class TitleBar : public Widget {
 public:
     const std::wstring& Text() const { return text_; }
     TitleBar& SetText(std::wstring_view text);
 
+    /// Shows/hides the app badge (gradient rounded square + title first letter) at the left edge.
+    /// Default visible. When hidden the badge area is caption drag space (no HTSYSMENU).
+    TitleBar& SetBadgeVisible(bool visible);
+    bool BadgeVisible() const { return badgeVisible_; }
+
+    /// Configures which built-in system buttons are shown (default WindowButtons::Default).
+    /// Visibility only; the maximize behavior is Window::SetMaximizable's concern.
+    TitleBar& SetSystemButtons(WindowButtons buttons);
+    WindowButtons SystemButtons() const { return systemButtons_; }
+
+    /// Adds a custom caption button to the LEFT of the system buttons (same 40x32 hit box, hover/press
+    /// fills and 16 DIP icon area as the built-in ones; round-65 R1.2-2). The callback fires on release
+    /// inside the button (dragging out cancels, same semantics as dialog buttons U-02). Returns the
+    /// button index (insertion order, left-to-right) for Toggled/SetToggled/SetButtonToolTip. Buttons
+    /// live for the window's lifetime (no removal).
+    int AddButton(const Icon& icon, std::function<void()> onClick);
+
+    /// Toggle variant: clicking flips the state first, then fires onToggled(newState). A toggled
+    /// button keeps a subtle active fill and tints its icon with the accent color.
+    int AddToggleButton(const Icon& icon, std::function<void(bool)> onToggled);
+
+    /// Reads/writes a toggle button's state. SetToggled repaints but does NOT fire onToggled
+    /// (out-of-range index: no-op / false).
+    bool Toggled(int index) const;
+    TitleBar& SetToggled(int index, bool on);
+
+    /// Per-button hover tooltip (shown by the standard hover tooltip machinery).
+    TitleBar& SetButtonToolTip(int index, std::wstring_view text);
+    const std::wstring& ButtonToolTip(int index) const;
+
 protected:
     float DockHeight() const override;
 
     void OnPaint(Painter& p, const Theme& theme) override;
+
+    // Custom caption buttons are client islands inside the non-client band (the rest of the bar is
+    // HTCAPTION): clicks and moves over them arrive as client messages dispatched to the title bar.
+    void OnMouseMove(const Point& pos) override;
+    void OnMouseLeave() override;
+    void OnMouseDown(const Point& pos) override;
+    void OnMouseUp(const Point& pos) override;
+    void OnCaptureLost() override;
 
 private:
     friend struct detail::WindowImpl;
@@ -1032,12 +1100,34 @@ private:
     int CaptionPressed() const { return captionPressed_; }
     TitleBar& SetCaptionPressed(int ht);
     bool WindowActive() const;
-    Rect ButtonRect(int index) const;   // 0=minimize 1=maximize 2=close
+    bool WindowMaximizable() const;
+    Rect ButtonRect(int index) const;   // slot index of the visible system buttons (rightmost = last)
     Rect BadgeRect() const;             // app badge (HTSYSMENU icon area, R32-09)
+
+    struct CaptionButton {
+        Icon icon;
+        std::function<void()> onClick;
+        std::function<void(bool)> onToggled;
+        bool toggle = false;
+        bool on = false;
+        std::wstring tooltip;
+    };
+    static constexpr float kCapW = 40.0f;   // caption button hit/draw box (R32-06)
+    static constexpr float kCapH = 32.0f;
+    float CaptionInset() const;             // scaled border-width inset (R32-07), shared by all button rects
+    int SystemSlotCount() const;
+    Rect CustomButtonRect(int index) const;
+    int CustomButtonAt(const Point& windowDip) const;   // index into customButtons_, or -1
+    void CommitCustom(int index);
 
     std::wstring text_;
     int captionHover_ = 0;        // hit code, 0 means no hover
     int captionPressed_ = 0;      // hit code of the pressed button, 0 means none (R32-01/05)
+    WindowButtons systemButtons_ = WindowButtons::Default;
+    bool badgeVisible_ = true;
+    std::vector<CaptionButton> customButtons_;   // insertion order = left-to-right
+    int customHover_ = -1;        // index into customButtons_, -1 = none
+    int customPressed_ = -1;      // index of the pressed custom button, -1 = none
 };
 
 // ---------------------------------------------------------------------------
@@ -2497,6 +2587,14 @@ public:
     /// nor affects minimization. R36-04: with no default lower bound, the window can shrink until the layout self-overlaps.
     Window& SetMinimumSize(float widthDip, float heightDip);
 
+    /// Enables/disables window maximization as a whole (round-65 R2.3, default enabled). Disabled,
+    /// every maximize path is suppressed: the title-bar maximize button (kept visible but inert —
+    /// hide it via GetTitleBar().SetSystemButtons), Win+Up, caption double-click, Aero Snap drag to
+    /// the screen top and the system-menu entry (WS_MAXIMIZEBOX removal + SC_MAXIMIZE swallowing).
+    /// Resize, minimize and normal moving are unaffected. The state may be toggled any time.
+    Window& SetMaximizable(bool enabled);
+    bool Maximizable() const;
+
     const Theme& GetTheme() const;
     Window& SetTheme(const Theme& theme);
 
@@ -2525,6 +2623,14 @@ public:
     NavigationView& AddNavigationView();
     StatusBar& AddStatusBar();
 
+    /// Access to the owner-drawn title bar (round-65 R1 control handover). The bar's mechanism (drag
+    /// to move, DPI, hover/press visuals) stays with the library; content is the consumer's to
+    /// configure: SetBadgeVisible, SetSystemButtons, AddButton/AddToggleButton (+ Toggled/SetToggled,
+    /// SetButtonToolTip). Right-click fires the bar's inherited OnContextMenuCb (window DIP
+    /// coordinates) — set it to pop the host's own menu; when unset the click is swallowed (the bar
+    /// is owner-drawn, no system menu applies).
+    TitleBar& GetTitleBar();
+
     /// Pops up a toast card at the window's bottom-right (auto-dismisses; display only, no interaction).
     void ShowToast(std::wstring_view title, std::wstring_view subtitle = L"");
 
@@ -2550,6 +2656,21 @@ public:
 
     void Show();
     void Close();
+
+    /// Hides the window without destroying it (round-65 R2.1). The process keeps running (Run()
+    /// exits by window count and a hidden window is still counted), the message loop keeps
+    /// dispatching (a tray helper window keeps receiving messages), and position, size and state
+    /// are preserved. Show() re-shows and activates. Pair with SetOnClosing to turn the close
+    /// button into "hide to tray" (the close interception already covers Alt+F4 and SC_CLOSE).
+    void Hide();
+
+    /// Always-on-top toggle (round-65 R2.2). Changes Z-order only: position, size and activation
+    /// are untouched. The state persists across minimize/hide/show (OS-managed style bit).
+    Window& SetTopmost(bool topmost);
+
+    /// Reads back the topmost state from the OS (WS_EX_TOPMOST), not mirrored library state —
+    /// external style changes by the host stay reflected truthfully.
+    bool IsTopmost() const;
 
     /// Close-request interception (API-10): called before both clicking the close button / Alt+F4 (WM_CLOSE) and programmatic
     /// Close(); returning false cancels the close (unsaved-changes confirmation scenario). Default
@@ -6247,6 +6368,9 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
     // converted to ptMinTrackSize by WM_GETMINMAXINFO
     float minWidthDip = 0;
     float minHeightDip = 0;
+    // Maximize enabled (round-65 R2.3, default): written by SetMaximizable, which also mirrors it
+    // into the WS_MAXIMIZEBOX style bit; WndProc consults it for SC_MAXIMIZE / caption double-click
+    bool maximizable = true;
 
     // External-interface state (API-10/11/12)
     std::function<bool()> onClosing;             // close interception: false = cancel
@@ -6639,6 +6763,9 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
                 MapWindowPoints(hwnd, nullptr, &org, 1);
                 Point dip{ (pt.x - org.x) * 96.0f / impl->dpi,
                            (pt.y - org.y) * 96.0f / impl->dpi };
+                // custom caption buttons (round-65 R1) are client islands inside the band: HTCLIENT
+                // routes their clicks/moves through the widget tree (hover/press/tooltip machinery)
+                if (impl->titlebar->CustomButtonAt(dip) >= 0) return HTCLIENT;
                 int ht = impl->titlebar->HitTest(dip);
                 if (ht != 0) return ht;   // title drag area and window buttons
             }
@@ -6709,6 +6836,14 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
                 impl->PostCaptionCommand(code);
                 return 0;
             }
+            break;
+        }
+        case WM_NCLBUTTONDBLCLK: {
+            // round-65 R2.3: DefWindowProc toggles maximize/restore on caption double-click; suppressed
+            // when maximization is disabled (WS_MAXIMIZEBOX removal already gates it — belt-and-braces
+            // so the toggle stays dead even on the direct NC path). Other hit codes keep default
+            // handling (HTSYSMENU badge double-click = close, R32-09/A13).
+            if (impl && !impl->maximizable && wParam == HTCAPTION) return 0;
             break;
         }
         }
@@ -7222,12 +7357,18 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
                 // from the 3rd click on, the system may stop sending WM_LBUTTONDBLCLK (plain DOWN instead);
                 // own counting synthesizes the multi-click event (triple-click select-all etc.)
                 if (cc >= 3) widget->OnDoubleClick(pos, cc);
+                // custom caption buttons (round-65 R1) are caption-like: pressing them changes no
+                // keyboard focus at all (native caption semantics — no focus steal, no focus clear)
+                bool captionButton = widget == impl->titlebar &&
+                                     impl->titlebar->CustomButtonAt(pos) >= 0;
                 // focus follows the click: clicking a non-focused widget clears focus. window_ guard (ARCH39-01):
                 // the OnMouseDown callback may already have Removed itself — DetachTree has run,
                 // window_ is nulled; a detached widget must not become focused, otherwise after end-of-frame destruction
                 // focused dangles (next frame's OnKeydown/OnUnfocused dereference freed memory)
-                if (widget->window_ && widget->Focusable()) impl->SetFocused(widget);
-                else if (impl->focused) impl->SetFocused(nullptr);
+                if (!captionButton) {
+                    if (widget->window_ && widget->Focusable()) impl->SetFocused(widget);
+                    else if (impl->focused) impl->SetFocused(nullptr);
+                }
             } else if (impl->focused) {
                 // ARCH-08: clicking empty space also clears keyboard focus — otherwise the caret
                 // keeps blinking in the blank area and keys keep routing to the widget that was clicked away from
@@ -7247,9 +7388,14 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
                 int cc = impl->BumpClickCount(pos);
                 widget->OnMouseDown(pos);
                 widget->OnDoubleClick(pos, cc);
-                // ARCH39-01: same as the single-click path — after a callback Removes itself, focus must not be set
-                if (widget->window_ && widget->Focusable()) impl->SetFocused(widget);
-                else if (impl->focused) impl->SetFocused(nullptr);
+                // round-65 R1: custom caption buttons change no keyboard focus (same as the
+                // single-click path above)
+                if (!(widget == impl->titlebar &&
+                      impl->titlebar->CustomButtonAt(pos) >= 0)) {
+                    // ARCH39-01: same as the single-click path — after a callback Removes itself, focus must not be set
+                    if (widget->window_ && widget->Focusable()) impl->SetFocused(widget);
+                    else if (impl->focused) impl->SetFocused(nullptr);
+                }
             }
             return 0;
         }
@@ -7326,6 +7472,16 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
             if (impl && impl->onClosing && !impl->onClosing()) return 0;
             DestroyWindow(hwnd);
             return 0;
+        }
+        case WM_SYSCOMMAND: {
+            // round-65 R2.3: with maximization disabled every SC_MAXIMIZE delivery path is swallowed
+            // (title-bar command, Win+Up hotkey, system-menu entry, programmatic posts); all other
+            // system commands (SC_MINIMIZE / SC_RESTORE / SC_CLOSE / SC_KEYMENU...) fall through to
+            // default handling unchanged. wParam's low 4 bits are internal (SDK contract)
+            if (impl && !impl->maximizable &&
+                (static_cast<unsigned long>(wParam) & 0xFFF0) == SC_MAXIMIZE)
+                return 0;
+            break;
         }
         case WM_SETTINGCHANGE: {
             // R37-03: system theme switches (ImmersiveColorSet) are handed to the user via callback;
@@ -7480,22 +7636,136 @@ TitleBar& TitleBar::SetCaptionPressed(int ht) {
     return *this;
 }
 
-/// Window button rects (window DIP coordinates): 0=minimize 1=maximize 2=close.
-Rect TitleBar::ButtonRect(int index) const {
-    constexpr float kCapW = 40.0f, kCapH = 32.0f;
-    float y = bounds_.y + (DockHeight() - kCapH) / 2.0f;
-    // normally the button row is inset by one scaled border width (R32-07): the rightmost b DIP of the window is always
-    // the HTRIGHT resize zone, so the buttons' hit box and draw box coincide; maximized, WM_NCHITTEST
-    // skips the border band and the buttons hug the client's right edge, consistent with the system
-    float inset = 0.0f;
+bool TitleBar::WindowMaximizable() const {
+    return !window_ || !window_->impl_ || window_->impl_->maximizable;
+}
+
+TitleBar& TitleBar::SetBadgeVisible(bool visible) {
+    if (badgeVisible_ != visible) {
+        badgeVisible_ = visible;
+        Invalidate();
+    }
+
+    return *this;
+}
+
+TitleBar& TitleBar::SetSystemButtons(WindowButtons buttons) {
+    if (systemButtons_ != buttons) {
+        systemButtons_ = buttons;
+        // a button that vanishes must not keep stale hover/press visuals (same clearing the
+        // WM_CAPTURECHANGED path does for stolen presses)
+        if (window_ && window_->impl_) window_->impl_->captionPressed = 0;
+        captionPressed_ = 0;
+        SetCaptionHover(0);
+        Invalidate();
+    }
+
+    return *this;
+}
+
+int TitleBar::AddButton(const Icon& icon, std::function<void()> onClick) {
+    CaptionButton b;
+    b.icon = icon;
+    b.onClick = std::move(onClick);
+    customButtons_.push_back(std::move(b));
+    Invalidate();
+
+    return static_cast<int>(customButtons_.size()) - 1;
+}
+
+int TitleBar::AddToggleButton(const Icon& icon, std::function<void(bool)> onToggled) {
+    CaptionButton b;
+    b.icon = icon;
+    b.toggle = true;
+    b.onToggled = std::move(onToggled);
+    customButtons_.push_back(std::move(b));
+    Invalidate();
+
+    return static_cast<int>(customButtons_.size()) - 1;
+}
+
+bool TitleBar::Toggled(int index) const {
+    return index >= 0 && index < static_cast<int>(customButtons_.size()) &&
+           customButtons_[index].toggle && customButtons_[index].on;
+}
+
+TitleBar& TitleBar::SetToggled(int index, bool on) {
+    if (index >= 0 && index < static_cast<int>(customButtons_.size()) &&
+        customButtons_[index].toggle && customButtons_[index].on != on) {
+        customButtons_[index].on = on;
+        Invalidate();
+    }
+
+    return *this;
+}
+
+TitleBar& TitleBar::SetButtonToolTip(int index, std::wstring_view text) {
+    if (index >= 0 && index < static_cast<int>(customButtons_.size())) {
+        customButtons_[index].tooltip.assign(text.begin(), text.end());
+        // a live hover on the edited button must follow the new text immediately (the popup
+        // snapshots the widget's tooltip text when created)
+        if (customHover_ == index && customPressed_ < 0 && window_ && window_->impl_) {
+            SetToolTip(text);
+            if (window_->impl_->tooltip) window_->impl_->CloseTooltip();
+            if (!customButtons_[index].tooltip.empty() && window_->impl_->hwnd)
+                PostMessageW(window_->impl_->hwnd, WM_TIMER, detail::kTipTimerId, 0);
+        }
+    }
+
+    return *this;
+}
+
+const std::wstring& TitleBar::ButtonToolTip(int index) const {
+    static const std::wstring kEmpty;
+    if (index >= 0 && index < static_cast<int>(customButtons_.size()))
+        return customButtons_[index].tooltip;
+    return kEmpty;
+}
+
+/// Scaled border-width inset of the caption button row (DIP): normally the row is inset by one
+/// border width (R32-07) — the rightmost b DIP of the window stays the HTRIGHT resize zone, so the
+/// buttons' hit box and draw box coincide; maximized, the row hugs the client's right edge,
+/// consistent with the system.
+float TitleBar::CaptionInset() const {
     if (window_ && window_->impl_ && window_->impl_->hwnd &&
         !IsZoomed(window_->impl_->hwnd)) {
         UINT dpi = GetDpiForWindow(window_->impl_->hwnd);
         int b = static_cast<int>(GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi)) +
                 GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-        inset = b * 96.0f / window_->impl_->dpi;
+        return b * 96.0f / window_->impl_->dpi;
     }
-    return { bounds_.x + bounds_.w - inset - (3 - index) * kCapW, y, kCapW, kCapH };
+    return 0.0f;
+}
+
+/// Number of visible system buttons (bit population of the Minimize/Maximize/Close flags).
+int TitleBar::SystemSlotCount() const {
+    unsigned v = static_cast<unsigned>(systemButtons_);
+    return static_cast<int>((v & 1u) + ((v >> 1) & 1u) + ((v >> 2) & 1u));
+}
+
+/// Caption button rect (window DIP coordinates). System buttons: index = slot of the visible ones,
+/// left-to-right in Minimize/Maximize/Close order, rightmost slot hugging the border inset.
+Rect TitleBar::ButtonRect(int index) const {
+    float y = bounds_.y + (DockHeight() - kCapH) / 2.0f;
+    int count = SystemSlotCount();
+    return { bounds_.x + bounds_.w - CaptionInset() - (count - index) * kCapW, y, kCapW, kCapH };
+}
+
+/// Custom caption button rect: continues leftward from the system block (or from the border inset
+/// when no system button is visible); insertion order = left-to-right.
+Rect TitleBar::CustomButtonRect(int index) const {
+    float y = bounds_.y + (DockHeight() - kCapH) / 2.0f;
+    float blockLeft = bounds_.x + bounds_.w - CaptionInset() - SystemSlotCount() * kCapW;
+    int n = static_cast<int>(customButtons_.size());
+    return { blockLeft - (n - index) * kCapW, y, kCapW, kCapH };
+}
+
+/// Custom button under the point (window DIP coordinates), or -1.
+int TitleBar::CustomButtonAt(const Point& dip) const {
+    if (dip.y < bounds_.y || dip.y >= bounds_.y + bounds_.h) return -1;
+    for (int i = static_cast<int>(customButtons_.size()) - 1; i >= 0; --i)
+        if (CustomButtonRect(i).Contains(dip.x, dip.y)) return i;
+    return -1;
 }
 
 Rect TitleBar::BadgeRect() const {
@@ -7505,11 +7775,19 @@ Rect TitleBar::BadgeRect() const {
 int TitleBar::HitTest(const Point& dip) const {
     if (dip.y < bounds_.y || dip.y >= bounds_.y + bounds_.h ||
         dip.x < bounds_.x || dip.x >= bounds_.x + bounds_.w) return 0;
-    for (int i = 2; i >= 0; --i) {   // close is rightmost, hit first
-        if (ButtonRect(i).Contains(dip.x, dip.y))
-            return i == 2 ? HTCLOSE : (i == 1 ? HTMAXBUTTON : HTMINBUTTON);
+    const int kHts[3] = { HTMINBUTTON, HTMAXBUTTON, HTCLOSE };   // WindowButtons bit order
+    unsigned v = static_cast<unsigned>(systemButtons_);
+    int slot = -1;
+    for (int i = 0; i < 3; ++i) {   // visible buttons left-to-right: Minimize, Maximize, Close
+        if (!((v >> i) & 1u)) continue;
+        ++slot;
+        if (ButtonRect(slot).Contains(dip.x, dip.y)) {
+            // disabled maximize (R2.3): the button rect is caption drag space
+            if (kHts[i] == HTMAXBUTTON && !WindowMaximizable()) return HTCAPTION;
+            return kHts[i];
+        }
     }
-    if (BadgeRect().Contains(dip.x, dip.y)) return HTSYSMENU;   // R32-09
+    if (badgeVisible_ && BadgeRect().Contains(dip.x, dip.y)) return HTSYSMENU;   // R32-09
     return HTCAPTION;
 }
 
@@ -7522,19 +7800,23 @@ void TitleBar::OnPaint(Painter& p, const Theme& theme) {
 
     // app badge: gradient rounded square + title first letter (dims with the whole title bar when inactive, R34-01)
     Rect badge = BadgeRect();
-    p.FillRoundedRectGradient(badge, 6, dim(theme.accentHover), dim(theme.accent));
-    wchar_t letter = text_.empty() ? L'S' : text_.front();
-    wchar_t letterText[2] = { letter, L'\0' };
-    p.DrawText(std::wstring_view(letterText, 1),
-               Font{ .size = 12.0f, .weight = FontWeight::Bold },
-               badge, dim(theme.textOnAccent), HAlign::Center, VAlign::Center);
+    if (badgeVisible_) {
+        p.FillRoundedRectGradient(badge, 6, dim(theme.accentHover), dim(theme.accent));
+        wchar_t letter = text_.empty() ? L'S' : text_.front();
+        wchar_t letterText[2] = { letter, L'\0' };
+        p.DrawText(std::wstring_view(letterText, 1),
+                   Font{ .size = 12.0f, .weight = FontWeight::Bold },
+                   badge, dim(theme.textOnAccent), HAlign::Center, VAlign::Center);
+    }
 
-    // window title (120 reserved on the right for the three window buttons)
-    float textX = badge.Right() + 10;
+    // window title (right side reserved for the visible caption buttons: system + custom)
+    float textX = badgeVisible_ ? badge.Right() + 10 : bounds_.x + 14;
+    float reserve =
+        static_cast<float>(SystemSlotCount() + static_cast<int>(customButtons_.size())) * kCapW;
     if (!text_.empty())
         p.DrawText(text_, Font{ .size = 13.0f },
                    { textX, bounds_.y,
-                     std::max(0.0f, bounds_.x + bounds_.w - 120.0f - textX),
+                     std::max(0.0f, bounds_.x + bounds_.w - reserve - textX),
                      DockHeight() },
                    dim(theme.titleText), HAlign::Left, VAlign::Center);
 
@@ -7549,8 +7831,12 @@ void TitleBar::OnPaint(Painter& p, const Theme& theme) {
     const Icon* kIcons[3] = { &kCapMin, &kCapMax, &kCapClose };
     bool zoomed = window_ && window_->impl_ && window_->impl_->hwnd &&
                   IsZoomed(window_->impl_->hwnd);
+    unsigned v = static_cast<unsigned>(systemButtons_);
+    int slot = -1;
     for (int i = 0; i < 3; ++i) {
-        Rect r = ButtonRect(i);
+        if (!((v >> i) & 1u)) continue;
+        ++slot;
+        Rect r = ButtonRect(slot);
         int ht = kHts[i];
         bool close = ht == HTCLOSE;
         bool pressed = active && captionPressed_ == ht && captionHover_ == ht;
@@ -7567,8 +7853,12 @@ void TitleBar::OnPaint(Painter& p, const Theme& theme) {
         // table (docs/项目约定.md, round-32 R32-06 registration).
         if (pressed || hovered)
             p.FillRect({ r.x, bounds_.y, r.w, r.Bottom() - bounds_.y }, fill);
+        // disabled maximize (R2.3): kept visible but dimmed, like the system's grayed-out button
+        bool maxDisabled = ht == HTMAXBUTTON && !WindowMaximizable();
         Color iconColor = (pressed || hovered) && close
                               ? theme.textOnAccent : dim(theme.titleText);
+        if (maxDisabled)
+            iconColor = Color{ iconColor.r, iconColor.g, iconColor.b, iconColor.a * 0.4f };
         // glyph drawing area 16 DIP (R32-08: the original 11 DIP left ink at ~2/3 of the system's;
         // Fluent System Icons use a 24-unit view box: square ink 13/24, × ink 14.1/24)
         Rect area{ r.x + (r.w - 16.0f) / 2.0f, r.y + (r.h - 16.0f) / 2.0f,
@@ -7585,6 +7875,101 @@ void TitleBar::OnPaint(Painter& p, const Theme& theme) {
         } else {
             p.DrawIcon(*kIcons[i], area, iconColor);
         }
+    }
+
+    // custom caption buttons (round-65 R1): same fills as the system buttons; a toggled button keeps
+    // a subtle active fill — also extending up to the band top, since the round-64 reasoning (a fill
+    // that stops at the hit box reads as a floating box) applies to persistent fills alike — and
+    // tints its icon with the accent color
+    for (int i = 0; i < static_cast<int>(customButtons_.size()); ++i) {
+        const CaptionButton& b = customButtons_[i];
+        Rect r = CustomButtonRect(i);
+        bool pressed = active && customPressed_ == i && customHover_ == i;
+        bool hovered = active && customHover_ == i && !pressed;
+        bool on = b.toggle && b.on;
+        Color fill = theme.titleBackground;
+        if (pressed)      fill = theme.captionPressed;
+        else if (hovered) fill = theme.hoverSoft;
+        else if (on)      fill = theme.subtleActive;
+        if (pressed || hovered || on)
+            p.FillRect({ r.x, bounds_.y, r.w, r.Bottom() - bounds_.y }, fill);
+        Color iconColor = on ? dim(theme.accent) : dim(theme.titleText);
+        Rect area{ r.x + (r.w - 16.0f) / 2.0f, r.y + (r.h - 16.0f) / 2.0f, 16.0f, 16.0f };
+        p.DrawIcon(b.icon, area, iconColor);
+    }
+}
+
+// Custom caption buttons live on client islands: the window machinery dispatches client mouse
+// messages here (hover/press/tooltip), while release-inside commits mirror the dialog-button
+// semantics (U-02: dragging out cancels, re-entry resumes).
+
+void TitleBar::OnMouseMove(const Point& pos) {
+    int idx = CustomButtonAt(pos);
+    // while a press is held (window capture), only the held button shows the pressed fill; hovering
+    // others shows nothing (same semantics as the NC system buttons, R32-01/05)
+    int hover = customPressed_ >= 0 ? (idx == customPressed_ ? idx : -1) : idx;
+    if (hover == customHover_) return;
+    customHover_ = hover;
+    Invalidate();
+    // per-button tooltip: the popup snapshots the widget's tooltip text when created, and the
+    // hovered-change block checks ToolTip() BEFORE this handler runs — so every rect change rewrites
+    // the text and (re)arms the standard tip timer; the kTipTimerId path re-derives everything
+    // (hovered + non-empty text + no popup yet), making redundant posts and stale popups self-healing
+    SetToolTip(hover >= 0 ? std::wstring_view(customButtons_[hover].tooltip)
+                          : std::wstring_view{});
+    if (window_ && window_->impl_) {
+        if (window_->impl_->tooltip) window_->impl_->CloseTooltip();
+        if (hover >= 0 && !customButtons_[hover].tooltip.empty() && window_->impl_->hwnd)
+            PostMessageW(window_->impl_->hwnd, WM_TIMER, detail::kTipTimerId, 0);
+    }
+}
+
+void TitleBar::OnMouseLeave() {
+    if (customHover_ != -1) {
+        customHover_ = -1;
+        SetToolTip(std::wstring_view{});
+        Invalidate();
+    }
+    // the pressed state survives a leave while captured (release inside still commits, U-02)
+}
+
+void TitleBar::OnMouseDown(const Point& pos) {
+    customPressed_ = CustomButtonAt(pos);
+    if (customPressed_ >= 0) {
+        customHover_ = customPressed_;   // show the pressed state while held
+        Invalidate();
+    }
+}
+
+void TitleBar::OnMouseUp(const Point& pos) {
+    int pressed = customPressed_;
+    customPressed_ = -1;
+    if (pressed < 0) return;
+    // commit only when released over the same button (U-02); the callback may reconfigure the bar,
+    // so the pressed state is cleared first
+    int idx = CustomButtonAt(pos);
+    customHover_ = idx;
+    Invalidate();
+    if (idx == pressed) CommitCustom(pressed);
+}
+
+void TitleBar::OnCaptureLost() {
+    // capture stolen (Alt+Tab etc.): cancel the pressed state, else it sticks (round-15 §3.15)
+    if (customPressed_ != -1) {
+        customPressed_ = -1;
+        Invalidate();
+    }
+}
+
+void TitleBar::CommitCustom(int index) {
+    if (index < 0 || index >= static_cast<int>(customButtons_.size())) return;
+    CaptionButton& b = customButtons_[index];
+    if (b.toggle) {
+        b.on = !b.on;
+        Invalidate();
+        if (b.onToggled) b.onToggled(b.on);
+    } else if (b.onClick) {
+        b.onClick();
     }
 }
 
@@ -12739,6 +13124,31 @@ Window& Window::SetMinimumSize(float widthDip, float heightDip) {
     return *this;
 }
 
+Window& Window::SetMaximizable(bool enabled) {
+    if (!impl_) return *this;
+    impl_->maximizable = enabled;
+    if (impl_->hwnd) {
+        LONG_PTR style = GetWindowLongPtrW(impl_->hwnd, GWL_STYLE);
+        LONG_PTR desired =
+            enabled ? (style | WS_MAXIMIZEBOX) : (style & ~WS_MAXIMIZEBOX);
+        if (desired != style) {
+            SetWindowLongPtrW(impl_->hwnd, GWL_STYLE, desired);
+            // WS_MAXIMIZEBOX is the OS-level gate for the snap/maximize suite (Win+Up, Aero Snap,
+            // system-menu entry, caption double-click); SC_MAXIMIZE posts are swallowed in WndProc.
+            // FRAMECHANGED applies the style without moving, sizing or activating the window
+            SetWindowPos(impl_->hwnd, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                         SWP_FRAMECHANGED);
+        }
+    }
+
+    return *this;
+}
+
+bool Window::Maximizable() const {
+    return impl_ && impl_->maximizable;
+}
+
 const Theme& Window::GetTheme() const {
     return impl_->theme;
 }
@@ -12899,6 +13309,23 @@ void Window::Show() {
     if (impl_->hwnd) ShowWindow(impl_->hwnd, SW_SHOW);
 }
 
+void Window::Hide() {
+    if (impl_->hwnd) ShowWindow(impl_->hwnd, SW_HIDE);
+}
+
+Window& Window::SetTopmost(bool topmost) {
+    if (!impl_ || !impl_->hwnd) return *this;
+    SetWindowPos(impl_->hwnd, topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+                 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    return *this;
+}
+
+bool Window::IsTopmost() const {
+    if (!impl_ || !impl_->hwnd) return false;
+    return (GetWindowLongPtrW(impl_->hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+}
+
 void Window::Close() {
     if (impl_ && impl_->hwnd) {
         // API-10: programmatic close shares the WM_CLOSE contract and can be intercepted by SetOnClosing
@@ -12981,6 +13408,11 @@ void Window::CenterOnScreen() {
 
 bool Window::IsAlive() const {
     return impl_ && impl_->hwnd != nullptr;
+}
+
+TitleBar& Window::GetTitleBar() {
+    // the title bar is created with the window (ctor) and never null (round-65 R1 entry point)
+    return *impl_->titlebar;
 }
 
 // ---------------------------------------------------------------------------
