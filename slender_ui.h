@@ -109,10 +109,14 @@
 /// on this OS — no WM_CONTEXTMENU, no system menu; verified r107ctx), the title-bar context menu
 /// also anchored at the cursor when nothing has focus (R5 preferred option), TitleBar::SetHeight
 /// with edge-to-edge caption buttons (R6) and TitleBar::SetToggledFillVisible (R6).
+/// 0.50.0 = consumer-requirement round 3 (round-67): TitleBar::SetCaptionInset/CaptionInset (R7) —
+/// the caption button row's right-edge inset becomes a consumer-settable value (0 = the close
+/// button hugs the window's top-right corner, like a maximized system window; negative restores
+/// the automatic one-border-width inset), hit and draw geometry move together.
 #define SLENDER_UI_VERSION_MAJOR 0
-#define SLENDER_UI_VERSION_MINOR 49
+#define SLENDER_UI_VERSION_MINOR 50
 #define SLENDER_UI_VERSION_PATCH 0
-#define SLENDER_UI_VERSION "0.49.0"
+#define SLENDER_UI_VERSION "0.50.0"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
@@ -1045,8 +1049,8 @@ constexpr bool HasWindowButton(WindowButtons buttons, WindowButtons flag) {
 /// minimize/maximize/close buttons. Apps need not and should not create or lay out this widget manually; they configure it
 /// through Window::GetTitleBar() (round-65 R1): badge visibility, the system-button set, custom caption buttons (with
 /// toggle state and per-button tooltips), a right-click takeover via the inherited OnContextMenuCb (round-66 R5: fires on
-/// the real physical caption right-click, not only on synthetic messages), the band height (round-66 R6) and the toggled
-/// fill visibility (round-66 R6).
+/// the real physical caption right-click, not only on synthetic messages), the band height (round-66 R6), the toggled
+/// fill visibility (round-66 R6) and the row's right-edge inset (round-67 R7).
 class TitleBar : public Widget {
 public:
     const std::wstring& Text() const { return text_; }
@@ -1096,6 +1100,21 @@ public:
     TitleBar& SetToggledFillVisible(bool visible);
     bool ToggledFillVisible() const { return toggledFill_; }
 
+    /// Caption button row right-edge inset in DIP (round-67 R7): the gap between the rightmost
+    /// caption button and the window's right edge. The default is automatic: one scaled border
+    /// width (R32-07), leaving the rightmost b DIP of the band to the HTRIGHT resize zone so the
+    /// buttons' hit box and draw box coincide; maximized, the automatic inset is 0, consistent
+    /// with the system. Pass an explicit value to override it in every window state (0 = the
+    /// close button hugs the window's top-right corner, like a maximized system window; the
+    /// topmost corner strip keeps its HTTOPRIGHT priority) or a negative value to restore the
+    /// automatic behavior. Hit geometry and drawing share the same rects: hover/press fills and
+    /// WM_NCHITTEST move together. Changing the value clears any stale caption hover/press.
+    TitleBar& SetCaptionInset(float insetDip);
+    /// Effective right-edge inset (DIP): the explicit value when set, otherwise the automatic
+    /// one above (border width scaled by the window DPI; 0 while maximized or before the
+    /// window exists).
+    float CaptionInset() const;
+
 protected:
     float DockHeight() const override;
 
@@ -1136,7 +1155,6 @@ private:
     };
     static constexpr float kCapW = 40.0f;   // caption button hit/draw box (R32-06)
     static constexpr float kCapH = 32.0f;
-    float CaptionInset() const;             // scaled border-width inset (R32-07), shared by all button rects
     int SystemSlotCount() const;
     Rect CustomButtonRect(int index) const;
     int CustomButtonAt(const Point& windowDip) const;   // index into customButtons_, or -1
@@ -1152,6 +1170,7 @@ private:
     int customPressed_ = -1;      // index of the pressed custom button, -1 = none
     float height_ = 42.0f;        // caption band height (R6): default keeps every pre-0.49 geometry
     bool toggledFill_ = true;     // toggled custom buttons draw the subtleActive fill (R6)
+    float captionInsetOverride_ = -1.0f;   // explicit right-edge inset (R7); <0 = automatic (R32-07)
 };
 
 // ---------------------------------------------------------------------------
@@ -7704,6 +7723,22 @@ TitleBar& TitleBar::SetToggledFillVisible(bool visible) {
     return *this;
 }
 
+TitleBar& TitleBar::SetCaptionInset(float insetDip) {
+    if (captionInsetOverride_ != insetDip) {
+        captionInsetOverride_ = insetDip;
+        // the whole row shifts: stale hover/press codes may point at geometry that moved
+        // (same clearing SetSystemButtons does for vanished buttons)
+        if (window_ && window_->impl_) window_->impl_->captionPressed = 0;
+        captionPressed_ = 0;
+        customHover_ = -1;
+        customPressed_ = -1;
+        SetCaptionHover(0);
+        Invalidate();
+    }
+
+    return *this;
+}
+
 TitleBar& TitleBar::SetText(std::wstring_view text) {
     text_.assign(text.begin(), text.end());
     Invalidate();
@@ -7819,11 +7854,13 @@ const std::wstring& TitleBar::ButtonToolTip(int index) const {
     return kEmpty;
 }
 
-/// Scaled border-width inset of the caption button row (DIP): normally the row is inset by one
-/// border width (R32-07) — the rightmost b DIP of the window stays the HTRIGHT resize zone, so the
-/// buttons' hit box and draw box coincide; maximized, the row hugs the client's right edge,
-/// consistent with the system.
+/// Effective right-edge inset of the caption button row (DIP): an explicit value set via
+/// SetCaptionInset wins in every window state; otherwise the automatic value — normally one
+/// border width (R32-07) so the rightmost b DIP of the band stay the HTRIGHT resize zone and
+/// the buttons' hit box and draw box coincide, and 0 while maximized (the row hugs the
+/// client's right edge, consistent with the system) or before the window exists.
 float TitleBar::CaptionInset() const {
+    if (captionInsetOverride_ >= 0.0f) return captionInsetOverride_;
     if (window_ && window_->impl_ && window_->impl_->hwnd &&
         !IsZoomed(window_->impl_->hwnd)) {
         UINT dpi = GetDpiForWindow(window_->impl_->hwnd);
