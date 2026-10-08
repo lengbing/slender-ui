@@ -117,10 +117,17 @@
 /// (R8) — Windows 11 system rounded corners for the main window, opt-in (default stays square);
 /// the same DWM corner-preference path the popup host already uses, OS-truth readback, Windows 10
 /// silently keeps square corners; geometry, hit-testing and all other window states untouched.
+/// 0.52.0 = consumer-requirement round 5 (round-69): TreeView programmatic selection (R9) —
+/// SetSelectedRow/Select/SelectedRow. The selection is the flat visible-row index (0 = first
+/// visible row) and follows its node across row-table rebuilds (-1 once the row is not
+/// rendered, e.g. after an ancestor was collapsed — previously the stale index could read
+/// out of bounds from OnKeydown); notify=true replays one activation (node onClick then
+/// OnClick, expansion never toggled), out-of-range rows and out-of-tree nodes are rejected,
+/// keyboard focus untouched.
 #define SLENDER_UI_VERSION_MAJOR 0
-#define SLENDER_UI_VERSION_MINOR 51
+#define SLENDER_UI_VERSION_MINOR 52
 #define SLENDER_UI_VERSION_PATCH 0
-#define SLENDER_UI_VERSION "0.51.0"
+#define SLENDER_UI_VERSION "0.52.0"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
@@ -2037,6 +2044,27 @@ public:
     /// repaint — this is the entry point that takes effect immediately.
     TreeView& SetNodeText(Node& node, std::wstring_view text);
 
+    /// Programmatic row selection (R9, round-69). The row number is the flat visible-row
+    /// index (0 = first visible row) — the same numbering OnMouseUp and the arrow keys
+    /// write. -1 clears the selection (same contract as ComboBox/ListView/NavigationView::
+    /// SetSelectedIndex). Out-of-range rows are rejected and the selection is left
+    /// unchanged. Only the selection state changes: the keyboard focus is untouched, and
+    /// no callback fires unless notify is true — then exactly one activation is replayed
+    /// (node onClick, then OnClick); expansion is never toggled programmatically.
+    TreeView& SetSelectedRow(int row, bool notify = false);
+
+    /// Node-based selection (R9, round-69): collapsed ancestors of node are expanded so
+    /// its row becomes visible, then the row is selected. A node that does not belong to
+    /// this tree is rejected without touching anything (no expansion, no selection
+    /// change). Focus and callback semantics match SetSelectedRow.
+    TreeView& Select(Node& node, bool notify = false);
+
+    /// The selected row as a flat visible-row index, -1 when nothing is selected. The
+    /// selection follows its node across row-table rebuilds: rows added or removed above
+    /// it shift the index, and once the selected node is no longer rendered (its ancestor
+    /// was collapsed) the selection reads -1.
+    int SelectedRow() const;
+
     /// Removes all roots (API62-01, round-62); hover and keyboard-focus row reset. Nodes are owned
     /// (unique_ptr), so their references must not be used after this call.
     void Clear();
@@ -2075,7 +2103,9 @@ private:
     mutable std::vector<Row> rows_;
     mutable bool rowsDirty_ = true;
     int hover_ = -1;
-    int keyRow_ = -1;   // keyboard-focus row (arrow keys move, Enter/Space activates, U-02)
+    mutable int keyRow_ = -1;   // selection/keyboard-focus row, an index into rows_ (U-02);
+                                // mutable because RebuildRows() re-points it so the selection
+                                // follows its node across rebuilds (-1 once the row is hidden)
 };
 
 // ---------------------------------------------------------------------------
@@ -10823,7 +10853,69 @@ void TreeView::Clear() {
     Invalidate();
 }
 
+int TreeView::SelectedRow() const {
+    if (rowsDirty_) RebuildRows();
+    return keyRow_;
+}
+
+TreeView& TreeView::SetSelectedRow(int row, bool notify) {
+    if (rowsDirty_) RebuildRows();
+    // same "reject out-of-range" contract as ComboBox/ListView/NavigationView::SetSelectedIndex
+    // (OBS53-01): -1 = clear the selection, anything else outside [0, rows) is ignored
+    if (row < -1 || row >= static_cast<int>(rows_.size())) return *this;
+    if (keyRow_ != row) { keyRow_ = row; Invalidate(); }
+    // notify replays one activation — the same pair a leaf click fires (OnMouseUp); a -1
+    // clear has no row to activate and stays silent even with notify
+    if (notify && row >= 0) {
+        Node* node = rows_[row].node;
+        if (node->onClick) node->onClick();
+        if (OnClick) OnClick(*node);
+    }
+    return *this;
+}
+
+TreeView& TreeView::Select(Node& node, bool notify) {
+    // ownership first (R9.2.4): a node of another tree must not be touched here — no
+    // expansion of its ancestors, no selection change anywhere
+    bool owned = false;
+    std::function<void(const std::vector<std::unique_ptr<Node>>&)> walk =
+        [&](const std::vector<std::unique_ptr<Node>>& nodes) {
+            for (const auto& n : nodes) {
+                if (owned) return;
+                if (n.get() == &node) { owned = true; return; }
+                walk(n->children);
+            }
+        };
+    walk(roots_);
+    if (!owned) return *this;
+
+    // expand collapsed ancestors so the target row is rendered (R9.2.5); the node's own
+    // expansion state is left exactly as it is
+    bool grew = false;
+    for (Node* a = node.parent; a; a = a->parent)
+        if (!a->expanded_) { a->expanded_ = true; grew = true; }
+    if (grew) { rowsDirty_ = true; Relayout(); }
+    if (rowsDirty_) RebuildRows();
+    for (int i = 0; i < static_cast<int>(rows_.size()); ++i)
+        if (rows_[i].node == &node) { keyRow_ = i; break; }
+    Invalidate();
+    if (notify) {
+        if (node.onClick) node.onClick();
+        if (OnClick) OnClick(node);
+    }
+    return *this;
+}
+
 void TreeView::RebuildRows() const {
+    // keyRow_ indexes rows_, so rebuilding under it would leave the selection dangling —
+    // silently pointing at a different node, or past the end where OnKeydown reads
+    // rows_[keyRow_] out of bounds (reachable through the public SetExpanded on an
+    // ancestor of the selected row). Re-point the selection to its node first; mouse and
+    // keyboard activation always select the row they act on, so internal paths re-point
+    // to the same index and only the "selected row got hidden" path observes a change
+    // (to -1, R9 round-69).
+    Node* selected = keyRow_ >= 0 && keyRow_ < static_cast<int>(rows_.size())
+                         ? rows_[keyRow_].node : nullptr;
     rows_.clear();
     std::function<void(const std::vector<std::unique_ptr<Node>>&, int)> walk =
         [&](const std::vector<std::unique_ptr<Node>>& nodes, int depth) {
@@ -10834,6 +10926,10 @@ void TreeView::RebuildRows() const {
             }
         };
     walk(roots_, 0);
+    keyRow_ = -1;
+    if (selected)
+        for (int i = 0; i < static_cast<int>(rows_.size()); ++i)
+            if (rows_[i].node == selected) { keyRow_ = i; break; }
     rowsDirty_ = false;
 }
 
