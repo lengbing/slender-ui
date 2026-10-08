@@ -103,10 +103,16 @@
 /// (Window::GetTitleBar + TitleBar badge/system-button configuration + custom caption buttons with
 /// toggle state and per-button tooltips, R1), Window::Hide (R2.1), Window::SetTopmost/IsTopmost
 /// (R2.2), Window::SetMaximizable full-path maximize suppression (R2.3).
+/// 0.49.0 = consumer-requirement round 2 (round-66): Window::Minimized/Restore for tray-click
+/// restore (R4), the caption right-click takeover made reachable on the real physical path
+/// (R5: WM_NCRBUTTONUP with HTCAPTION is delivered but DefWindowProc synthesizes nothing from it
+/// on this OS — no WM_CONTEXTMENU, no system menu; verified r107ctx), the title-bar context menu
+/// also anchored at the cursor when nothing has focus (R5 preferred option), TitleBar::SetHeight
+/// with edge-to-edge caption buttons (R6) and TitleBar::SetToggledFillVisible (R6).
 #define SLENDER_UI_VERSION_MAJOR 0
-#define SLENDER_UI_VERSION_MINOR 48
+#define SLENDER_UI_VERSION_MINOR 49
 #define SLENDER_UI_VERSION_PATCH 0
-#define SLENDER_UI_VERSION "0.48.0"
+#define SLENDER_UI_VERSION "0.49.0"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
@@ -1038,7 +1044,9 @@ constexpr bool HasWindowButton(WindowButtons buttons, WindowButtons flag) {
 /// Owner-drawn title bar (created and docked at the very top automatically by the window): app badge, window title, and
 /// minimize/maximize/close buttons. Apps need not and should not create or lay out this widget manually; they configure it
 /// through Window::GetTitleBar() (round-65 R1): badge visibility, the system-button set, custom caption buttons (with
-/// toggle state and per-button tooltips), and a right-click takeover via the inherited OnContextMenuCb.
+/// toggle state and per-button tooltips), a right-click takeover via the inherited OnContextMenuCb (round-66 R5: fires on
+/// the real physical caption right-click, not only on synthetic messages), the band height (round-66 R6) and the toggled
+/// fill visibility (round-66 R6).
 class TitleBar : public Widget {
 public:
     const std::wstring& Text() const { return text_; }
@@ -1073,6 +1081,20 @@ public:
     /// Per-button hover tooltip (shown by the standard hover tooltip machinery).
     TitleBar& SetButtonToolTip(int index, std::wstring_view text);
     const std::wstring& ButtonToolTip(int index) const;
+
+    /// Caption band height in DIP (default 42; round-66 R6). The band layout, hit test and every
+    /// caption geometry derive from it. Caption buttons keep their 32 DIP box and are centered
+    /// vertically, so a 32 DIP bar (the Windows standard height) makes them fill the band
+    /// edge-to-edge with no gap above or below. Values below the button height clamp to it —
+    /// the box is never clipped. Triggers a window relayout.
+    TitleBar& SetHeight(float height);
+    float Height() const { return height_; }
+
+    /// A toggled custom button draws a persistent subtleActive fill by default (extending up to
+    /// the band top, like every caption fill since round-64). Turn this off to signal the state
+    /// through the icon accent tint alone (round-66 R6); icon colors are unaffected.
+    TitleBar& SetToggledFillVisible(bool visible);
+    bool ToggledFillVisible() const { return toggledFill_; }
 
 protected:
     float DockHeight() const override;
@@ -1128,6 +1150,8 @@ private:
     std::vector<CaptionButton> customButtons_;   // insertion order = left-to-right
     int customHover_ = -1;        // index into customButtons_, -1 = none
     int customPressed_ = -1;      // index of the pressed custom button, -1 = none
+    float height_ = 42.0f;        // caption band height (R6): default keeps every pre-0.49 geometry
+    bool toggledFill_ = true;     // toggled custom buttons draw the subtleActive fill (R6)
 };
 
 // ---------------------------------------------------------------------------
@@ -2663,6 +2687,17 @@ public:
     /// are preserved. Show() re-shows and activates. Pair with SetOnClosing to turn the close
     /// button into "hide to tray" (the close interception already covers Alt+F4 and SC_CLOSE).
     void Hide();
+
+    /// True while the window is minimized (iconic) (round-66 R4). SW_SHOW does not restore a
+    /// minimized window, so tray-click patterns branch on this: Restore() when minimized,
+    /// Show() otherwise. (Named Minimized, not IsMinimized: windowsx.h defines IsMinimized
+    /// as a function-like macro alias of IsIconic and would rewrite the declaration.)
+    bool Minimized() const;
+
+    /// SW_RESTORE (round-66 R4): a minimized window comes back to its previous size and position
+    /// (a window that was maximized before minimizing comes back maximized) and is activated.
+    /// On a visible window this is just an activation. Show() keeps its plain SW_SHOW semantics.
+    void Restore();
 
     /// Always-on-top toggle (round-65 R2.2). Changes Z-order only: position, size and activation
     /// are untouched. The state persists across minimize/hide/show (OS-managed style bit).
@@ -6749,11 +6784,8 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
                 if (t && r) return HTTOPRIGHT;
                 if (btm && l) return HTBOTTOMLEFT;
                 if (btm && r) return HTBOTTOMRIGHT;
-                if (l) return HTLEFT;
-                if (r) return HTRIGHT;
-                if (t) return HTTOP;
-                if (btm) return HTBOTTOM;
             }
+            int caption = 0;
             if (impl->titlebar) {
                 // hit-testing shares client coordinates with layout/draw (R33-01): normally the client origin equals
                 // the window origin; when maximized WM_NCCALCSIZE insets the client origin by one border width, and
@@ -6767,8 +6799,22 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
                 // routes their clicks/moves through the widget tree (hover/press/tooltip machinery)
                 if (impl->titlebar->CustomButtonAt(dip) >= 0) return HTCLIENT;
                 int ht = impl->titlebar->HitTest(dip);
-                if (ht != 0) return ht;   // title drag area and window buttons
+                // caption buttons and the badge own their draw box even where the top resize band
+                // overlaps it (round-66 R6: with a 32 DIP band the buttons start at y=0, and the
+                // system frame behaves the same — measured on Explorer, only the topmost strip of
+                // the close button still reads HTTOP). HTCAPTION keeps deferring to the borders.
+                if (ht != 0 && ht != HTCAPTION) return ht;
+                caption = ht;
             }
+            if (!IsZoomed(hwnd)) {
+                bool l = pt.x < rc.left + b, r = pt.x >= rc.right - b;
+                bool t = pt.y < rc.top + b, btm = pt.y >= rc.bottom - b;
+                if (l) return HTLEFT;
+                if (r) return HTRIGHT;
+                if (t) return HTTOP;
+                if (btm) return HTBOTTOM;
+            }
+            if (caption) return caption;
             return HTCLIENT;
         }
         case WM_NCACTIVATE: {
@@ -6803,6 +6849,22 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
         case WM_NCMOUSELEAVE: {
             if (impl) {
                 impl->SetCaptionHover(0);
+            }
+            break;
+        }
+        case WM_NCRBUTTONUP: {
+            // round-66 R5: the caption band is HTCAPTION, so a physical right-click arrives as
+            // this NC message — and DefWindowProc turns it into nothing on this OS (r107ctx trace:
+            // no WM_CONTEXTMENU synthesis, no system menu), which left the round-65 takeover hook
+            // unreachable from real input. Hand the caption release to the same context-menu exit
+            // the pointer path uses, so TitleBar::OnContextMenuCb fires with window DIP
+            // coordinates. With no callback wired the dispatch is a no-op and the release stays
+            // swallowed (unchanged status quo: never a system menu). Other hit codes (HTSYSMENU
+            // badge) keep default handling.
+            if (impl && impl->titlebar && wParam == HTCAPTION) {
+                DispatchContextMenu(impl, hwnd,
+                                    POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
+                return 0;
             }
             break;
         }
@@ -7155,6 +7217,21 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
 
 
     // ---- concern 10/14: right-click and context-menu unified exit (R36-03) (ARCH58-01) ----
+
+    // Shared dispatch for the WM_CONTEXTMENU pointer branch and the WM_NCRBUTTONUP caption branch
+    // (round-66 R5): convert a screen point to window DIP, hit-test the widget tree and dispatch.
+    // Returns true when a widget took the menu (caller returns "handled"); false = default handling.
+    static bool DispatchContextMenu(WindowImpl* impl, HWND hwnd, POINT spt) {
+        if (!impl) return false;
+        ScreenToClient(hwnd, &spt);
+        Point pos{ spt.x * 96.0f / impl->dpi, spt.y * 96.0f / impl->dpi };
+        if (Widget* widget = impl->HitTest(pos)) {
+            widget->OnContextMenu(pos);
+            return true;
+        }
+        return false;
+    }
+
     static std::optional<LRESULT> OnContextMenu(HWND hwnd, WindowImpl* impl,
                                         UINT msg, WPARAM wParam, LPARAM lParam) {
         (void)wParam;   // this concern does not consume this parameter
@@ -7173,21 +7250,25 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
             // (text-input widgets anchor at the caret via ImeAnchorPoint).
             if (!impl) break;
             if (lParam == -1) {
-                if (!impl->focused) break;
-                Point a;
-                if (!impl->focused->ImeAnchorPoint(a))
-                    a = { impl->focused->bounds_.x,
-                          impl->focused->bounds_.y + impl->focused->bounds_.h };
-                impl->focused->OnContextMenu(a);
-                return 0;
+                if (impl->focused) {
+                    Point a;
+                    if (!impl->focused->ImeAnchorPoint(a))
+                        a = { impl->focused->bounds_.x,
+                              impl->focused->bounds_.y + impl->focused->bounds_.h };
+                    impl->focused->OnContextMenu(a);
+                    return 0;
+                }
+                // round-66 R5 (the consumer's preferred option): with nothing focused the keyboard
+                // gesture still reaches the tree, anchored at the cursor — this also makes the
+                // title-bar takeover reachable without any focusable widget. No widget under the
+                // cursor: default handling, as before.
+                POINT pt{};
+                if (GetCursorPos(&pt) && DispatchContextMenu(impl, hwnd, pt)) return 0;
+                break;
             }
-            POINT spt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            ScreenToClient(hwnd, &spt);
-            Point pos{ spt.x * 96.0f / impl->dpi, spt.y * 96.0f / impl->dpi };
-            if (Widget* widget = impl->HitTest(pos)) {
-                widget->OnContextMenu(pos);
+            if (DispatchContextMenu(impl, hwnd,
+                                    POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) }))
                 return 0;
-            }
             break;   // nothing to take over (e.g. a system-generated NC right-click): default handling
         }
         }
@@ -7605,7 +7686,23 @@ bool Widget::Focused() const {
 // title bar implementation
 // ---------------------------------------------------------------------------
 
-float TitleBar::DockHeight() const { return 42.0f; }
+float TitleBar::DockHeight() const { return height_; }
+
+TitleBar& TitleBar::SetHeight(float height) {
+    // buttons keep their 32 DIP box: a band shorter than that would clip them
+    height_ = std::max(kCapH, height);
+    Relayout();   // the dock band, button rects, badge and title all derive from the height
+    return *this;
+}
+
+TitleBar& TitleBar::SetToggledFillVisible(bool visible) {
+    if (toggledFill_ != visible) {
+        toggledFill_ = visible;
+        Invalidate();
+    }
+
+    return *this;
+}
 
 TitleBar& TitleBar::SetText(std::wstring_view text) {
     text_.assign(text.begin(), text.end());
@@ -7769,7 +7866,8 @@ int TitleBar::CustomButtonAt(const Point& dip) const {
 }
 
 Rect TitleBar::BadgeRect() const {
-    return { bounds_.x + 14, bounds_.y + 11, 20, 20 };
+    // vertically centered on the band (11 DIP at the default 42 — identical pre-0.49 geometry)
+    return { bounds_.x + 14, bounds_.y + (DockHeight() - 20.0f) / 2.0f, 20, 20 };
 }
 
 int TitleBar::HitTest(const Point& dip) const {
@@ -7887,11 +7985,12 @@ void TitleBar::OnPaint(Painter& p, const Theme& theme) {
         bool pressed = active && customPressed_ == i && customHover_ == i;
         bool hovered = active && customHover_ == i && !pressed;
         bool on = b.toggle && b.on;
+        bool fillOn = on && toggledFill_;   // R6: the persistent fill is optional, the tint is not
         Color fill = theme.titleBackground;
         if (pressed)      fill = theme.captionPressed;
         else if (hovered) fill = theme.hoverSoft;
-        else if (on)      fill = theme.subtleActive;
-        if (pressed || hovered || on)
+        else if (fillOn)  fill = theme.subtleActive;
+        if (pressed || hovered || fillOn)
             p.FillRect({ r.x, bounds_.y, r.w, r.Bottom() - bounds_.y }, fill);
         Color iconColor = on ? dim(theme.accent) : dim(theme.titleText);
         Rect area{ r.x + (r.w - 16.0f) / 2.0f, r.y + (r.h - 16.0f) / 2.0f, 16.0f, 16.0f };
@@ -13311,6 +13410,22 @@ void Window::Show() {
 
 void Window::Hide() {
     if (impl_->hwnd) ShowWindow(impl_->hwnd, SW_HIDE);
+}
+
+bool Window::Minimized() const {
+    // round-66 R4: SW_SHOW does not restore an iconic window, so tray-click
+    // patterns need to tell "show" from "restore" — read the OS truth.
+    // (Named Minimized, not IsMinimized: windowsx.h owns IsMinimized as a
+    // function-like macro alias of IsIconic.)
+    return impl_->hwnd && IsIconic(impl_->hwnd);
+}
+
+void Window::Restore() {
+    // round-66 R4: SW_RESTORE — a minimized window comes back to its previous
+    // size and position (a window that was maximized before minimizing comes
+    // back maximized) and is activated; on a visible window this is just an
+    // activation. Show() keeps its plain SW_SHOW semantics.
+    if (impl_->hwnd) ShowWindow(impl_->hwnd, SW_RESTORE);
 }
 
 Window& Window::SetTopmost(bool topmost) {
