@@ -124,10 +124,22 @@
 /// out of bounds from OnKeydown); notify=true replays one activation (node onClick then
 /// OnClick, expansion never toggled), out-of-range rows and out-of-tree nodes are rejected,
 /// keyboard focus untouched.
+/// 0.53.0 = consumer-requirement round 6 (round-70): the public event surface the first
+/// plugin (cozy-todo) needs (R10-R13). Widget::OnHoverChanged/Hovered — hover-chain
+/// enter/leave exactly once per transition, propagated along the hit chain like the
+/// container highlight state (whose walk it generalizes; highlight rendering unchanged),
+/// cleared on WM_MOUSELEAVE, on window deactivation and on subtree detach. Widget::
+/// OnDoubleClickCb — multi-click activation (clickCount from BumpClickCount, 2 / ≥3; single
+/// clicks never fire; a callback that moves focus is respected by the click-focus defaults).
+/// TextBox::OnCommitted (Enter; unsubscribed keeps the previous fall-through) and
+/// TextBox::OnFocusLost (genuine focus transfers only — DetachTree clears focus silently so
+/// commit-and-rebuild flows cannot double-fire). Window::SetSizeChangedHandler — the client
+/// DIP size actually changed, fired after layout is current; SIZE_MINIMIZED and DPI-only
+/// rescales never fire.
 #define SLENDER_UI_VERSION_MAJOR 0
-#define SLENDER_UI_VERSION_MINOR 52
+#define SLENDER_UI_VERSION_MINOR 53
 #define SLENDER_UI_VERSION_PATCH 0
-#define SLENDER_UI_VERSION "0.52.0"
+#define SLENDER_UI_VERSION "0.53.0"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
@@ -509,6 +521,32 @@ public:
 
     /// Right-click callback (context-menu entry point; coordinates are window coordinates).
     std::function<void(const Point&)> OnContextMenuCb;
+
+    /// Multi-click activation callback (round-70 R11): fires after the protected OnDoubleClick
+    /// for WM_LBUTTONDBLCLK (clickCount 2) and after the synthesized multi-click path
+    /// (clickCount ≥ 3, delivered as WM_LBUTTONDOWN). clickCount is BumpClickCount's ordinal
+    /// (system double-click time/rect); pos is in window DIP coordinates. Single clicks
+    /// (count 1) never fire; widgets that do not subscribe are unaffected — existing
+    /// double-click semantics (TextBox word-select etc.) run unchanged before this callback.
+    std::function<void(const Point&, int clickCount)> OnDoubleClickCb;
+
+    /// Hover enter/leave callback (round-70 R10): fires exactly once per transition of the
+    /// hover-chain state — true when this widget or any descendant becomes the hover target,
+    /// false when it leaves the chain (moving inside the same subtree never churns ancestors:
+    /// a row stays "hovered" while the mouse crosses its children). Shares the framework's
+    /// single hover judgment with the tooltip and the container hover highlight; no repaint is
+    /// forced by the callback itself (hide/show children inside it invalidate on their own).
+    /// The state clears on WM_MOUSELEAVE (mouse left the window), on window deactivation
+    /// (WM_ACTIVATE WA_INACTIVE — R32-02's no-leak rule extended from the caption to the
+    /// client area) and when the widget's subtree is detached (silently — the subscription is
+    /// being destroyed with it); a hidden (SetVisible(false)) hovered widget resets on the
+    /// next mouse move. Occlusion without a mouse move produces no OS message — native
+    /// behavior, self-correcting on the next move.
+    std::function<void(bool)> OnHoverChanged;
+
+    /// Whether this widget or any descendant is the current hover target — the same state
+    /// OnHoverChanged reports; always matches the last callback value.
+    bool Hovered() const { return hoverLit_; }
 
     // ---- Sizing policies in layout containers (see Row/Column; not used by widgets with manual SetBounds) ----
 
@@ -944,6 +982,27 @@ public:
     /// Clicking a suggestion replaces the text with the suggestion content and fires OnSuggestion.
     TextBox& SetSuggestions(std::vector<std::wstring> items);
     std::function<void(const std::wstring&)> OnSuggestion;
+
+    /// Enter commit (round-70 R12): fires when the box receives VK_RETURN and this callback is
+    /// subscribed (the current text is passed; fire-on-Enter regardless of emptiness — filter
+    /// in the callback). The key is fully consumed either way: with a focused widget,
+    /// WM_KEYDOWN never reaches DefWindowProc. Higher-priority interceptors are unchanged and
+    /// run first — the dialog modal branch (Enter commits the focused footer button), window
+    /// accelerators (API-11, matched before the focused widget) and an open AutoSuggest popup
+    /// (Enter accepts the suggestion). Enter during IME composition arrives as VK_PROCESSKEY
+    /// and never reaches here. Enter-commit does not blur — a later blur fires OnFocusLost
+    /// again, so "Enter or blur" consumers fence double commits (the requirement's documented
+    /// contract; the fence on our side: removal clears focus silently, see OnFocusLost).
+    std::function<void(const std::wstring&)> OnCommitted;
+
+    /// Focus lost (round-70 R12): fires after OnUnfocused for genuine focus transfers — click
+    /// elsewhere, Tab, programmatic SetFocus, and window deactivation (WM_ACTIVATE WA_INACTIVE
+    /// already blurs: long-standing library behavior, unlike native controls that keep focus
+    /// while inactive). Fires regardless of whether the text changed. NOT fired when the box
+    /// is removed mid-edit: DetachTree clears focus silently (no user callbacks while a
+    /// subtree is mid-detach, ARCH39-02), so a commit-and-rebuild flow cannot double-fire
+    /// through the removal it performs inside its own commit callback.
+    std::function<void()> OnFocusLost;
 
 protected:
     bool Focusable() const override { return true; }
@@ -2795,6 +2854,17 @@ public:
     /// re-resolve together with SystemPrefersDark() (the live semantics of the baseline prefers-color-scheme —
     /// browsers recompute and repaint live when the system theme switches).
     Window& SetSystemThemeChangedHandler(std::function<void()> handler);
+
+    /// Client-size change notification (round-70 R13): fires when the client area's DIP size
+    /// actually changed since the last notification, after the library has brought layout
+    /// current — widget Bounds() read fresh at call time (the tooltip-on-truncation use:
+    /// recompute MeasureText(text, font) vs Bounds().w here, then SetToolTip). Never fires
+    /// while minimized (SIZE_MINIMIZED is skipped); a DPI-only rescale with an unchanged pixel
+    /// size does not fire (use SetDpiChangedHandler for those); size changes driven by the
+    /// host itself without a window resize (panel widths etc.) are the host's own actions —
+    /// refresh at those points. Subscribing before Show() delivers the initial size on the
+    /// first WM_SIZE (each real change fires exactly once, including the drag-resize stream).
+    Window& SetSizeChangedHandler(std::function<void()> handler);
 
     /// Keyboard accelerators (API-11): matched at the WM_KEYDOWN/WM_SYSKEYDOWN stage before the focused widget;
     /// all of Ctrl/Shift/Alt must match to hit; on hit the callback fires and the key is swallowed.
@@ -5954,7 +6024,14 @@ public:
     /// Switch keyboard focus (nullptr clears), notifying old and new widgets and repainting.
     void SetFocused(Widget* widget) {
         if (focused == widget) return;
-        if (focused) focused->OnUnfocused();
+        if (focused) {
+            focused->OnUnfocused();
+            // R12: public focus-lost notification — genuine transfers only. DetachTree clears
+            // focus silently (no user callbacks mid-detach, ARCH39-02), so removing the focused
+            // box cannot double-fire a commit-and-rebuild flow.
+            if (auto* tb = dynamic_cast<TextBox*>(focused))
+                if (tb->OnFocusLost) tb->OnFocusLost();
+        }
         focused = widget;
         if (widget) widget->OnFocused();
         impl()->Invalidate();
@@ -6088,18 +6165,23 @@ public:
         return widget->HitTarget(pos);
     }
 
-    /// Container hover highlight: highlight containers on the chain of the hovered (or drag-captured) widget light up,
-    /// those left go dark. target == nullptr means everything leaves.
+    /// Hover-chain state (round-70 R10; was "container hover highlight" before the walk went
+    /// unfiltered): the widgets on the chain of the hovered (or drag-captured) widget light up,
+    /// those left go dark. target == nullptr means everything leaves. Before R10 the collect
+    /// filter kept only containers with hoverHighlight_ — the only reader was Container::OnPaint.
+    /// The walk is now unfiltered so any widget can read Hovered() / subscribe OnHoverChanged;
+    /// highlight containers get exactly the same transitions as before (identical lit set, so
+    /// rendering is unchanged), and only they Invalidate — lit has no rendering effect
+    /// elsewhere, so unsubscribed trees change nothing observable.
     void UpdateContainerHover(Widget* from, Widget* to) {
         auto collect = [](Widget* w, Widget** buf, int& n) {
-            for (; w; w = w->parent_)
-                if (w->hoverHighlight_) {
-                    if (n >= 32) return;   // GAP50-09: fixed-size stack array; on overflow, truncate rather than write out of bounds
-                    buf[n++] = w;
-                }
+            for (; w; w = w->parent_) {
+                if (n >= 64) return;   // GAP50-09: fixed-size stack array; on overflow, truncate rather than write out of bounds (the chain top is dropped)
+                buf[n++] = w;
+            }
         };
-        Widget* a[32]; int na = 0;
-        Widget* b[32]; int nb = 0;
+        Widget* a[64]; int na = 0;
+        Widget* b[64]; int nb = 0;
         collect(from, a, na);
         collect(to, b, nb);
         for (int i = 0; i < na; ++i) {
@@ -6107,14 +6189,29 @@ public:
             for (int j = 0; j < nb; ++j) still = still || b[j] == a[i];
             if (!still && a[i]->hoverLit_) {
                 a[i]->hoverLit_ = false;
-                a[i]->Invalidate();
+                if (a[i]->hoverHighlight_) a[i]->Invalidate();   // R10: lit is render-visible only for highlight containers
+                if (a[i]->OnHoverChanged) a[i]->OnHoverChanged(false);
             }
         }
         for (int j = 0; j < nb; ++j) {
             if (!b[j]->hoverLit_) {
                 b[j]->hoverLit_ = true;
-                b[j]->Invalidate();
+                if (b[j]->hoverHighlight_) b[j]->Invalidate();
+                if (b[j]->OnHoverChanged) b[j]->OnHoverChanged(true);
             }
+        }
+    }
+
+    /// Shared teardown of the client hover chain (round-70 R10): WM_MOUSELEAVE and the
+    /// WM_ACTIVATE WA_INACTIVE branch (R32-02's "no state leaks across activations" extended
+    /// from the caption to the client area) both close the tooltip, unlight the whole chain
+    /// (leave callbacks included) and drop the deep target with its OnMouseLeave.
+    void ClearHoverChain() {
+        impl()->CloseTooltip();
+        UpdateContainerHover(impl()->hovered, nullptr);
+        if (impl()->hovered) {
+            impl()->hovered->OnMouseLeave();
+            impl()->hovered = nullptr;
         }
     }
 
@@ -6486,12 +6583,21 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
     std::function<bool()> onClosing;             // close interception: false = cancel
     std::function<void(float)> onDpiChanged;     // DPI change notification
     std::function<void()> onSystemThemeChanged;  // system theme switch (R37-03)
+    std::function<void()> onSizeChanged;         // R13: client DIP size actually changed
+    // R13: last notified client size (DIP); sentinel -1 makes the first real WM_SIZE notify
+    float lastNotifiedW = -1;
+    float lastNotifiedH = -1;
 
 
     /// Cleanup when a subtree is detached from the window (API-06: Container::Remove/ClearChildren):
     /// animation subscription, keyboard focus, mouse capture and hover are reset if they fall inside the subtree
     void DetachTree(Widget* w) {
         if (!w) return;
+        // R10: the detached subtree's own lit flag clears silently — the subtree (and every
+        // subscription inside it) is going away, and no user callback may run mid-detach
+        // (DetachTree executes inside Container::Remove's children_ iteration, ARCH39-02).
+        // Every recursive call below passes through here, so the whole subtree resets.
+        w->hoverLit_ = false;
         // ARCH38-06: before detaching, close popups owned by the subtree (their OwnerWidget is about to dangle);
         // at this point the subtree's parent chain is still intact, so ownership can be walked upward
         if (flyout && flyout->OwnerWidget() && InSubtree(flyout->OwnerWidget(), w))
@@ -6504,12 +6610,22 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
         if (auto* c = dynamic_cast<Container*>(w))
             for (auto& child : c->children_) DetachTree(child.get());
         RemoveAnimator(w);
-        if (focused == w) SetFocused(nullptr);
+        if (focused && InSubtree(focused, w)) {
+            // R12: protected cleanup only, deliberately not SetFocused — the public
+            // TextBox::OnFocusLost must not fire while a commit callback could re-enter
+            // Remove (ARCH39-02). API-06's documented intent ("keyboard focus ... reset if
+            // they fall inside the subtree") covers the whole subtree, not just its root;
+            // clearing only focused == w left focus pointing into the detached subtree.
+            focused->OnUnfocused();
+            focused = nullptr;
+        }
         if (captured == w) {
             captured = nullptr;
             if (hwnd) ReleaseCapture();
         }
-        if (hovered == w) {
+        if (hovered && InSubtree(hovered, w)) {
+            // R10: same subtree-wide contract as the focus clear above (was hovered == w only).
+            // Ancestor lit flags clear silently above; the next mouse move rebuilds the chain.
             hovered = nullptr;
             CloseTooltip();   // ARCH38-06: the tooltip is pinned to the removed widget; close it to avoid an orphan
         }
@@ -7002,8 +7118,16 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
             GetClientRect(hwnd, &rc);
             if (rc.right > 0 && rc.bottom > 0) {
                 // write the real client size back as DIP so layout sizes are correct while drag-resizing the border
-                impl->clientW = static_cast<float>(rc.right) * 96.0f / impl->dpi;
-                impl->clientH = static_cast<float>(rc.bottom) * 96.0f / impl->dpi;
+                float wDip = static_cast<float>(rc.right) * 96.0f / impl->dpi;
+                float hDip = static_cast<float>(rc.bottom) * 96.0f / impl->dpi;
+                // R13: notify only on an actual DIP change since the last notification
+                // (idempotent WM_SIZE repeats stay silent; the -1 sentinel makes the first
+                // real size notify; SIZE_MINIMIZED never updates the sentinel)
+                bool notifySize = impl->onSizeChanged &&
+                                  (wDip != impl->lastNotifiedW ||
+                                   hDip != impl->lastNotifiedH);
+                impl->clientW = wDip;
+                impl->clientH = hDip;
                 if (impl->rt.ctx) {
                     impl->ResizeSwapChain(static_cast<UINT>(rc.right),
                                           static_cast<UINT>(rc.bottom));
@@ -7016,6 +7140,11 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
                 // DXGI_SCALING_NONE, DWM no longer stretches the old frame in misaligned-size gaps
                 impl->Render();
                 if (!impl->rt.ctx) impl->Invalidate(); // fall back to invalidate-repaint when the device is down
+                if (notifySize) {
+                    impl->lastNotifiedW = wDip;
+                    impl->lastNotifiedH = hDip;
+                    impl->onSizeChanged();   // R13: layout is current here — Bounds() read fresh
+                }
             }
             return 0;
         }
@@ -7026,6 +7155,10 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
         case WM_ACTIVATE: {
             if (impl && LOWORD(wParam) == WA_INACTIVE) {
                 impl->CloseMenus();
+                // R10: the client hover chain joins the no-leak rule — the caption hover
+                // clear below is R32-02; the mouse may still be over the window, state
+                // rebuilds from the next WM_MOUSEMOVE (leave callbacks fire exactly once)
+                impl->ClearHoverChain();
                 impl->SetFocused(nullptr);
                 // R32-02: deactivation clears title-bar hover/press; no state leaks across activations
                 impl->SetCaptionHover(0);
@@ -7462,12 +7595,7 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
         case WM_MOUSELEAVE: {
             if (!impl) break;
             impl->trackingMouse = false;
-            impl->CloseTooltip();
-            impl->UpdateContainerHover(impl->hovered, nullptr);
-            if (impl->hovered) {
-                impl->hovered->OnMouseLeave();
-                impl->hovered = nullptr;
-            }
+            impl->ClearHoverChain();   // R10: shared with the deactivation path
             return 0;
         }
         }
@@ -7509,10 +7637,16 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
                 impl->captured = widget;
                 SetCapture(hwnd);
                 int cc = impl->BumpClickCount(pos);
+                // R11: the multi-click callback may legitimately move focus (begin-edit
+                // flows); the click-focus defaults below apply only when it left focus alone
+                Widget* focusBefore = impl->focused;
                 widget->OnMouseDown(pos);
                 // from the 3rd click on, the system may stop sending WM_LBUTTONDBLCLK (plain DOWN instead);
                 // own counting synthesizes the multi-click event (triple-click select-all etc.)
-                if (cc >= 3) widget->OnDoubleClick(pos, cc);
+                if (cc >= 3) {
+                    widget->OnDoubleClick(pos, cc);
+                    if (widget->OnDoubleClickCb) widget->OnDoubleClickCb(pos, cc);   // R11
+                }
                 // custom caption buttons (round-65 R1) are caption-like: pressing them changes no
                 // keyboard focus at all (native caption semantics — no focus steal, no focus clear)
                 bool captionButton = widget == impl->titlebar &&
@@ -7521,7 +7655,7 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
                 // the OnMouseDown callback may already have Removed itself — DetachTree has run,
                 // window_ is nulled; a detached widget must not become focused, otherwise after end-of-frame destruction
                 // focused dangles (next frame's OnKeydown/OnUnfocused dereference freed memory)
-                if (!captionButton) {
+                if (!captionButton && impl->focused == focusBefore) {   // R11: focus moved inside the callback is respected
                     if (widget->window_ && widget->Focusable()) impl->SetFocused(widget);
                     else if (impl->focused) impl->SetFocused(nullptr);
                 }
@@ -7542,12 +7676,18 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
                 impl->captured = widget;
                 SetCapture(hwnd);
                 int cc = impl->BumpClickCount(pos);
+                // R11: a double-click callback may legitimately move focus (begin-edit flows —
+                // hide the label, show and focus a text box); the click-focus defaults below
+                // apply only when the callback left focus alone
+                Widget* focusBefore = impl->focused;
                 widget->OnMouseDown(pos);
                 widget->OnDoubleClick(pos, cc);
+                if (widget->OnDoubleClickCb) widget->OnDoubleClickCb(pos, cc);   // R11
                 // round-65 R1: custom caption buttons change no keyboard focus (same as the
                 // single-click path above)
                 if (!(widget == impl->titlebar &&
-                      impl->titlebar->CustomButtonAt(pos) >= 0)) {
+                      impl->titlebar->CustomButtonAt(pos) >= 0) &&
+                    impl->focused == focusBefore) {
                     // ARCH39-01: same as the single-click path — after a callback Removes itself, focus must not be set
                     if (widget->window_ && widget->Focusable()) impl->SetFocused(widget);
                     else if (impl->focused) impl->SetFocused(nullptr);
@@ -9520,6 +9660,15 @@ void TextBox::OnKeydown(uint32_t vk) {
     case 'V': if (ctrl) PasteFromClipboard(); break;
     case 'Z': if (ctrl) (shift ? Redo() : Undo()); break;   // Ctrl+Shift+Z = redo
     case 'Y': if (ctrl) Redo(); break;
+    case VK_RETURN:
+        // R12: Enter commits when subscribed; unsubscribed keeps the exact previous
+        // fall-through (handled = false — no caret nudge, zero observable change)
+        if (OnCommitted) {
+            OnCommitted(text_);
+            break;
+        }
+        handled = false;
+        break;
     case VK_LEFT: case VK_RIGHT: {
         int step = vk == VK_LEFT ? -1 : 1;
         if (ctrl) {   // move/select by word (R27-03; boundaries = measured native baseline input)
@@ -13649,6 +13798,12 @@ Window& Window::SetDpiChangedHandler(std::function<void(float newDpi)> handler) 
 
 Window& Window::SetSystemThemeChangedHandler(std::function<void()> handler) {
     impl_->onSystemThemeChanged = std::move(handler);
+
+    return *this;
+}
+
+Window& Window::SetSizeChangedHandler(std::function<void()> handler) {
+    impl_->onSizeChanged = std::move(handler);
 
     return *this;
 }
