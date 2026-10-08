@@ -113,10 +113,14 @@
 /// the caption button row's right-edge inset becomes a consumer-settable value (0 = the close
 /// button hugs the window's top-right corner, like a maximized system window; negative restores
 /// the automatic one-border-width inset), hit and draw geometry move together.
+/// 0.51.0 = consumer-requirement round 4 (round-68): Window::SetRoundedCorners/RoundedCorners
+/// (R8) — Windows 11 system rounded corners for the main window, opt-in (default stays square);
+/// the same DWM corner-preference path the popup host already uses, OS-truth readback, Windows 10
+/// silently keeps square corners; geometry, hit-testing and all other window states untouched.
 #define SLENDER_UI_VERSION_MAJOR 0
-#define SLENDER_UI_VERSION_MINOR 50
+#define SLENDER_UI_VERSION_MINOR 51
 #define SLENDER_UI_VERSION_PATCH 0
-#define SLENDER_UI_VERSION "0.50.0"
+#define SLENDER_UI_VERSION "0.51.0"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
@@ -2726,6 +2730,27 @@ public:
     /// external style changes by the host stay reflected truthfully.
     bool IsTopmost() const;
 
+    /// Windows 11 system rounded corners for the main window (round-68 R8, default off = square,
+    /// opt-in). Requests the DWM corner preference — the same attribute the popup host already
+    /// sets (PopupWindow::Create) — so the radius, the 1 px system border and the drop shadow are
+    /// the system's own (radius 8 DIP at 96 DPI, scaling with DPI; nothing is owner-drawn). On
+    /// Windows 10, or whenever the call fails, the window silently keeps square corners — the
+    /// same fallback the popup path has always had. The preference is a one-shot live window
+    /// state: it persists across show/hide, minimize/restore, DPI changes and SWP_FRAMECHANGED
+    /// style rewrites (SetMaximizable's mechanism), and is orthogonal to SetMaximizable and
+    /// SetTopmost. Purely an outer visual clip: the window rect, the client rect and every
+    /// WM_NCHITTEST answer (resize bands, caption, hit islands) are untouched — corner pixels
+    /// are cut visually only, hit-testing at the corners keeps its original semantics.
+    /// Maximizing or Aero-snapping squares the corners by OS policy and restores them on
+    /// return to the floating state. Pass false to restore the default square corners.
+    Window& SetRoundedCorners(bool rounded);
+
+    /// Reads back the corner preference from the OS (DwmGetWindowAttribute), not mirrored
+    /// library state — the same OS-truth contract as IsTopmost. True only while the window's
+    /// live corner preference is actually DWMWCP_ROUND: on Windows 10 this reads false even
+    /// immediately after SetRoundedCorners(true) (the request failed by design).
+    bool RoundedCorners() const;
+
     /// Close-request interception (API-10): called before both clicking the close button / Alt+F4 (WM_CLOSE) and programmatic
     /// Close(); returning false cancels the close (unsaved-changes confirmation scenario). Default
     /// does not intercept.
@@ -2890,6 +2915,7 @@ namespace detail {
 // on Windows 10 the call fails and drawing falls back to square corners.
 // ARCH38-03: moved into detail — previously in the global namespace, polluting consumer TUs
 inline constexpr DWORD kDwmwaWindowCornerPreference = 33;
+inline constexpr DWORD kDwmwcpDefault = 0;   // "let the system decide" — restores square corners on the borderless swap-chain window
 inline constexpr DWORD kDwmwcpRound = 2;
 
 template <class T>
@@ -13476,6 +13502,33 @@ Window& Window::SetTopmost(bool topmost) {
 bool Window::IsTopmost() const {
     if (!impl_ || !impl_->hwnd) return false;
     return (GetWindowLongPtrW(impl_->hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+}
+
+Window& Window::SetRoundedCorners(bool rounded) {
+    if (!impl_ || !impl_->hwnd) return *this;
+    // round-68 R8: the main window shares the popup host's DWM corner-preference path
+    // (PopupWindow::Create). One-shot: DWM keeps the preference for the window's lifetime, so
+    // no re-application is needed on show/hide, minimize/restore, WM_DPICHANGED or
+    // SWP_FRAMECHANGED. false restores DWMWCP_DEFAULT — on this borderless swap-chain window
+    // the system default is square corners, which is exactly the pre-call state. A failed call
+    // (Windows 10) leaves the window square; no error is raised, matching the popup contract —
+    // RoundedCorners() is the consumer's verification read.
+    DWORD pref = rounded ? detail::kDwmwcpRound : detail::kDwmwcpDefault;
+    DwmSetWindowAttribute(impl_->hwnd, detail::kDwmwaWindowCornerPreference,
+                          &pref, sizeof(pref));
+
+    return *this;
+}
+
+bool Window::RoundedCorners() const {
+    if (!impl_ || !impl_->hwnd) return false;
+    // OS truth (mirrors IsTopmost): reads the live DWM attribute back, so a host-side or
+    // system-side change stays reflected; on Windows 10 the read fails and returns false.
+    DWORD pref = 0;
+    return SUCCEEDED(DwmGetWindowAttribute(impl_->hwnd,
+                      detail::kDwmwaWindowCornerPreference,
+                      &pref, sizeof(pref))) &&
+           pref == detail::kDwmwcpRound;
 }
 
 void Window::Close() {
