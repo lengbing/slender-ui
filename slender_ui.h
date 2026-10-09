@@ -168,10 +168,16 @@
 /// ScrollViewer gains SetScrollBarVisibility (Always = the unchanged default, AutoHide =
 /// pointer-in-port / recent-scroll linger / drag / focus with a ~150ms fade, Hidden) and
 /// an unshown bar no longer takes track clicks.
+/// 0.55.1 = consumer-requirement round 12 (round-74): R21 — ToolTipPopup lays out
+/// '\n'-separated tooltip text as multiple lines: sized to the widest segment and one
+/// 12px×1.4 line box (16.8 DIP) per segment, drawn as one block with the matching
+/// UNIFORM line spacing instead of clipping into the one-line-height popup; the widest
+/// segment also drives the width for CRLF text ('\r' trimmed). A '\n'-free tooltip
+/// measures and draws exactly as 0.55.0.
 #define SLENDER_UI_VERSION_MAJOR 0
 #define SLENDER_UI_VERSION_MINOR 55
-#define SLENDER_UI_VERSION_PATCH 0
-#define SLENDER_UI_VERSION "0.55.0"
+#define SLENDER_UI_VERSION_PATCH 1
+#define SLENDER_UI_VERSION "0.55.1"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
@@ -5857,15 +5863,30 @@ constexpr UINT kCapTimerId = 5;     // title-bar hover safety-check timer (R32-0
 class ToolTipPopup : public PopupWindow {
 public:
     /// widgetRect: the target widget's rect in window client coordinates (DIP).
+    /// Text may contain '\n' (R21): each segment lays out as one tooltip line. The
+    /// popup sizes to the widest segment (width) and one 12px×1.4 line box per
+    /// segment (height); a '\n'-free text measures and draws exactly as 0.55.0.
     ToolTipPopup(HWND owner, float dpi, const Theme& theme,
                  const Rect& widgetRect, std::wstring_view text)
         : PopupWindow(owner, dpi, theme) {
         text_.assign(text.begin(), text.end());
 
         const Font font{ .size = 12.0f };
-        float textW = detail::MeasureTextWidth(text_, font);
+        // Measure per segment (R21): the NO_WRAP layout already honors hard breaks, but the
+        // widest line must come from per-line metrics anyway and this also fixes '\r'.
+        float textW = 0.0f;
+        for (size_t start = 0; start <= text_.size();) {
+            size_t nl = text_.find(L'\n', start);
+            std::wstring_view line{ text_.data() + start,
+                                    (nl == std::wstring::npos ? text_.size() : nl) - start };
+            if (!line.empty() && line.back() == L'\r') line.remove_suffix(1);   // CRLF sources
+            textW = std::max(textW, detail::MeasureTextWidth(line, font));
+            ++lines_;
+            if (nl == std::wstring::npos) break;
+            start = nl + 1;
+        }
         width_ = textW + 22.0f;   // baseline padding 5px 10px + border 1px×2 (B-16)
-        height_ = 28.8f;   // baseline 12px×1.4 line box 16.8 + padding 5×2 + border 2 = 28.8 (C-13)
+        height_ = lines_ * 16.8f + 12.0f;   // 12px×1.4 line box 16.8 per line + padding 5×2 + border 2 (C-13); one line == the 0.55.0 constant 28.8
 
         // shown 8px above the widget (aligned with the baseline); flipped below when it would leave the screen upward.
         const Rect& b = widgetRect;
@@ -5902,9 +5923,18 @@ protected:
 
 private:
     void OnDraw(RenderPainter& painter) override {
-        painter.DrawText(text_, Font{ .size = 12.0f },
-                         { 11, 0, std::max(0.0f, width_ - 22), height_ },
-                         theme_.text, HAlign::Left, VAlign::Center);
+        if (lines_ > 1) {
+            // R21: DWrite breaks at the hard newlines itself; the 1.4 line height selects the
+            // UNIFORM-spacing cached format (GetCachedFormat), so the block tiles at exactly the
+            // 16.8 DIP pitch the height formula counts and fits the content box unclipped.
+            painter.DrawText(text_, Font{ .size = 12.0f, .lineHeight = 1.4f },
+                             { 11, 0, std::max(0.0f, width_ - 22), height_ },
+                             theme_.text, HAlign::Left, VAlign::Center);
+        } else {
+            painter.DrawText(text_, Font{ .size = 12.0f },
+                             { 11, 0, std::max(0.0f, width_ - 22), height_ },
+                             theme_.text, HAlign::Left, VAlign::Center);
+        }
         // Border stroke, same contract as MenuPopup/Flyout (baseline .tt border, R25-11): along
         // the DWM 8px rounding — previously the square stroke got clipped by the rounding, leaving notched corners
         DrawStroke(painter);
@@ -5917,6 +5947,7 @@ private:
     }
 
     std::wstring text_;
+    size_t lines_ = 0;   // '\n'-separated segments, counted by the ctor loop (R21); 1 keeps the 0.55.0 single-line path
 };
 
 /// Whether focus came from the keyboard (set on WM_KEYDOWN, cleared on mouse-down): only keyboard navigation draws the focus ring.
