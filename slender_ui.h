@@ -157,15 +157,41 @@
 /// buttons' icons (previously hardcoded theme.text there); a non-IconOnly button with an
 /// icon but empty text centers the bare 16px icon (the 8px icon-text gap no longer
 /// pushes it 4px left of the box center).
+/// 0.55.0 = consumer-requirement rounds 9-11 (round-73): caret metrics (R17), native
+/// handle (R18), message hook (R19) and scrollbar visibility (R20). TextBox's caret band
+/// follows the text's line box (the metrics the centered draw uses) instead of a fixed
+/// ±7 inset, so short boxes keep a caret at least as tall as the text ink (the
+/// selection fill deliberately stays full-box, the WinUI-native look); Window gains a
+/// read-only NativeHandle() (live HWND, nullptr before creation success / after destroy)
+/// and a SetMessageHook consumer hook that fires before the library's concern chain —
+/// WM_NCCREATE / WM_DESTROY / WM_NCDESTROY are observable but can never be swallowed;
+/// ScrollViewer gains SetScrollBarVisibility (Always = the unchanged default, AutoHide =
+/// pointer-in-port / recent-scroll linger / drag / focus with a ~150ms fade, Hidden) and
+/// an unshown bar no longer takes track clicks.
 #define SLENDER_UI_VERSION_MAJOR 0
-#define SLENDER_UI_VERSION_MINOR 54
+#define SLENDER_UI_VERSION_MINOR 55
 #define SLENDER_UI_VERSION_PATCH 0
-#define SLENDER_UI_VERSION "0.54.0"
+#define SLENDER_UI_VERSION "0.55.0"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
 struct HICON__;
 typedef struct HICON__* HICON;
+
+// R18/R19 (round-73) put HWND and the message-surface integer types into the public Window
+// API under the same no-windows.h-in-public-section rule. HWND is a pointer to an opaque
+// struct — the same shape of forward declaration as HICON above. UINT / WPARAM / LPARAM /
+// LRESULT are integral and platform-dependent, so their widths come from <basetsd.h>
+// (UINT_PTR / LONG_PTR) instead of hard-coded ones; whatever order windows.h is included
+// in (before or after this header), the SDK's own typedefs name the very same types —
+// C++ allows a typedef name to be redeclared for the type it already refers to.
+#include <basetsd.h>
+struct HWND__;
+typedef struct HWND__* HWND;
+typedef unsigned int UINT;
+typedef UINT_PTR WPARAM;
+typedef LONG_PTR LPARAM;
+typedef LONG_PTR LRESULT;
 
 namespace slender {
 
@@ -671,6 +697,14 @@ protected:
     virtual void OnPostPaint(Painter& p, const Theme& theme) { (void)p; (void)theme; }
     virtual void OnMouseMove(const Point& pos) { (void)pos; }
     virtual void OnMouseLeave() {}
+    /// Hover-chain transition (round-73 R20): the framework-side twin of OnHoverChanged —
+    /// fires on the same enter/leave transitions (this widget or a descendant becomes, or
+    /// stops being, the hover target; subtree detachment stays silent exactly like the
+    /// callback). Virtual so a control can track "pointer is over me or mine" internally
+    /// without consuming the consumer's OnHoverChanged subscription. For a viewport
+    /// container whose children are hit-clipped to the port (ScrollViewer), chain
+    /// membership is exactly "pointer inside the viewport".
+    virtual void OnHoverChainChanged(bool entered) { (void)entered; }
     /// Mouse capture taken away by the system (WM_CAPTURECHANGED: Alt+Tab, popups, etc.): cancel the pressed state.
     /// Do not reuse OnMouseLeave — most widgets' leave clears only hover_, not pressed_,
     /// which would leave the pressed state stuck (round-15 §3.15)
@@ -2588,6 +2622,19 @@ private:
     int selected_ = 0, hover_ = -1;
 };
 
+/// Scrollbar visibility (round-73 R20). Always draws the bar whenever the content
+/// overflows the viewport — the 0.54.0 behavior and the default, so existing consumers
+/// and the baseline rendering are untouched. AutoHide keeps it invisible until the
+/// pointer enters the scroll area, a scroll happens (wheel, keyboard, programmatic
+/// scroll, thumb drag — the bar then lingers briefly before fading out) or the viewer
+/// holds keyboard focus; Hidden never draws it. Only when the bar paints changes:
+/// geometry, colors, wheel and keyboard scrolling are identical in every mode, and an
+/// unshown bar stops taking track clicks as well (see ScrollViewer::SetScrollBarVisibility).
+/// (The getter is named GetScrollBarVisibility, deliberately not like the type: a member
+/// sharing the enum's name would shadow the type inside the class scope and break every
+/// later ScrollBarVisibility::AutoHide spelling there.)
+enum class ScrollBarVisibility { Always, AutoHide, Hidden };
+
 /// Scroll container: wheel-scrolls when content exceeds the viewport; draws a thin scrollbar.
 class ScrollViewer : public Container {
 public:
@@ -2604,6 +2651,19 @@ public:
     /// Notifies on scroll (for navigation-linked highlighting).
     std::function<void()> OnScrolled;
 
+    /// Scrollbar visibility (round-73 R20; default Always = the pre-R20 constant draw).
+    /// AutoHide shows the bar while the pointer is over the scroll area (this widget or any
+    /// descendant hovered), while a scroll is recent (~1.2s linger, then a ~150ms fade-out),
+    /// during a thumb drag even when the pointer strays off the bar, and while the viewer
+    /// holds keyboard focus. Hidden never draws. The hit contract follows the paint: an
+    /// unshown bar takes no track clicks (the right-edge page band only fires while the
+    /// bar is shown — an invisible scrollbar never eats a click aimed at content), and
+    /// grabbing the thumb equally requires the bar to be shown. Wheel and keyboard
+    /// scrolling work unchanged in every mode. The switch re-seeds the fade state: Always
+    /// shows at once, AutoHide fades in immediately if the pointer is already inside.
+    ScrollViewer& SetScrollBarVisibility(ScrollBarVisibility v);
+    ScrollBarVisibility GetScrollBarVisibility() const { return barVisibility_; }
+
 protected:
     void AssignBounds(const Rect& area) override;
     Size DesiredSize() const override;
@@ -2618,6 +2678,10 @@ protected:
     bool ChildPaintClip(Rect* out) const override;
     bool Focusable() const override { return true; }   // reachable via Tab (R27-02)
     void OnKeydown(uint32_t vk) override;
+    void OnAnimate() override;               // R20: AutoHide fade / linger frames
+    void OnHoverChainChanged(bool entered) override;   // R20: pointer entered/left the port
+    void OnFocused() override;               // R20: show the bar while keyboard-focused
+    void OnUnfocused() override;
 
 private:
     float scrollY_ = 0;
@@ -2627,6 +2691,20 @@ private:
     bool draggingThumb_ = false;
     float dragGrabOffset_ = 0;       // offset of the press point relative to the thumb top
     bool thumbHover_ = false;
+    // R20 (round-73) auto-hide state. barAlpha_ is the fade value the bar paints with
+    // (1 = fully shown; Always keeps it at 1, Hidden never paints). barLinger_ counts
+    // down the post-scroll "shown despite no pointer" window, in animation frames.
+    ScrollBarVisibility barVisibility_ = ScrollBarVisibility::Always;
+    float barAlpha_ = 1.0f;
+    int barLinger_ = 0;
+    static constexpr int kBarLingerFrames = 36;   // ≈1.2s at the 30fps animation dispatch
+    /// Whether the bar should be up right now (the fade target; also the hit gate for
+    /// thumb grab and track paging — an invisible bar never eats clicks).
+    bool BarShown() const;
+    /// Re-evaluates the AutoHide state and (re)starts the fade dispatch; lingerFrames
+    /// sets the post-scroll show window (0 = pure state re-evaluation). No-op outside
+    /// AutoHide — Always renders constant, Hidden renders nothing.
+    void WakeScrollBar(int lingerFrames);
 };
 
 /// Left navigation view (docked control): brand row + group labels + nav items + footer text.
@@ -2894,6 +2972,41 @@ public:
     /// live corner preference is actually DWMWCP_ROUND: on Windows 10 this reads false even
     /// immediately after SetRoundedCorners(true) (the request failed by design).
     bool RoundedCorners() const;
+
+    /// Native window handle (round-73 R18, read-only). The live HWND, or nullptr when
+    /// creation failed (LastError() then says so) or once the window has been destroyed —
+    /// WM_DESTROY clears it, so after Close() (or the destructor started) this reads
+    /// nullptr; do not hand the stale value to anything. The handle exists from the
+    /// constructor on (it is created eagerly, before Show), so hosts can call
+    /// DragAcceptFiles / ITaskbarList3 / DWM attributes right after building the window.
+    /// Read-only hand-off: the library keeps owning the window procedure, the style bits
+    /// it manages and the widget tree — consumers pass the handle TO Win32; replacing the
+    /// window procedure (SetWindowLongPtrW GWLP_WNDPROC / SetWindowSubclass) is out of
+    /// contract, SetMessageHook below is the controlled participation point for messages.
+    HWND NativeHandle() const;
+
+    /// Consumer message hook (round-73 R19). Fires inside the window procedure BEFORE the
+    /// library's own concern chain, for every message from WM_NCCREATE on (the hook lives
+    /// on the window's instance state, which WM_NCCREATE binds; earlier creation-phase
+    /// messages such as WM_GETMINMAXINFO cannot reach it). Returning a value handles the
+    /// message: that value becomes the window procedure's result and neither the library
+    /// nor DefWindowProcW sees the message. Returning std::nullopt passes on: the library's
+    /// path runs and unhandled messages fall to DefWindowProcW as before.
+    /// Enforced exceptions — the hook may OBSERVE these three but can never swallow them
+    /// (the library always runs its own path, whatever the hook returns): WM_NCCREATE (the
+    /// GWLP_USERDATA binding that makes the window more than an empty shell), WM_DESTROY
+    /// (window registry / icon / device cleanup) and WM_NCDESTROY. This is enforced at the
+    /// library level, not left to caller discipline — a swallowed one produces a
+    /// live-looking window with dead internal state, the failure mode that is hardest to
+    /// diagnose. Everything else (WM_DROPFILES, WM_COPYDATA, WM_APP+x, ...) is the hook's
+    /// to take. Set it right after construction — WM_DROPFILES can be among a window's
+    /// first messages, no need to wait for Show — and clear it again with
+    /// SetMessageHook(nullptr). Runs synchronously on the window's own thread like every
+    /// library callback: keep it cheap and do not pump messages or destroy the window
+    /// from inside it.
+    using MessageHook = std::function<std::optional<LRESULT>(
+        UINT msg, WPARAM wParam, LPARAM lParam)>;
+    Window& SetMessageHook(MessageHook hook);
 
     /// Close-request interception (API-10): called before both clicking the close button / Alt+F4 (WM_CLOSE) and programmatic
     /// Close(); returning false cancels the close (unsaved-changes confirmation scenario). Default
@@ -6280,6 +6393,7 @@ public:
                 a[i]->hoverLit_ = false;
                 if (a[i]->hoverHighlight_) a[i]->Invalidate();   // R10: lit is render-visible only for highlight containers
                 if (a[i]->OnHoverChanged) a[i]->OnHoverChanged(false);
+                a[i]->OnHoverChainChanged(false);   // R20: framework-side twin, see Widget
             }
         }
         for (int j = 0; j < nb; ++j) {
@@ -6287,6 +6401,7 @@ public:
                 b[j]->hoverLit_ = true;
                 if (b[j]->hoverHighlight_) b[j]->Invalidate();
                 if (b[j]->OnHoverChanged) b[j]->OnHoverChanged(true);
+                b[j]->OnHoverChainChanged(true);   // R20: framework-side twin, see Widget
             }
         }
     }
@@ -6676,6 +6791,10 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
     // R13: last notified client size (DIP); sentinel -1 makes the first real WM_SIZE notify
     float lastNotifiedW = -1;
     float lastNotifiedH = -1;
+    // R19 (round-73): consumer message hook — first participant in the window procedure
+    // (contract on Window::SetMessageHook). WM_NCCREATE observes it from OnNcCreate, the
+    // only point where the instance state it lives on already exists.
+    std::function<std::optional<LRESULT>(UINT, WPARAM, LPARAM)> messageHook;
 
 
     /// Cleanup when a subtree is detached from the window (API-06: Container::Remove/ClearChildren):
@@ -6970,6 +7089,17 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
         auto* impl = reinterpret_cast<WindowImpl*>(
             GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 
+        // R19 (round-73): the consumer hook runs before the concern chain. WM_DESTROY /
+        // WM_NCDESTROY are forced forward — observable, but the library's cleanup path runs
+        // whatever the hook returns. WM_NCCREATE is excluded here (impl is not yet bound,
+        // there is nothing to look the hook up on) and is observed inside OnNcCreate right
+        // after the binding instead.
+        if (impl && impl->messageHook) {
+            bool forced = (msg == WM_DESTROY || msg == WM_NCDESTROY);
+            if (auto r = impl->messageHook(msg, wParam, lParam); r && !forced)
+                return *r;
+        }
+
         // ARCH58-01 (stage 1): the original single switch's 35 message cases (678 lines) were split by concern
         // into the 14 handlers below. Each handler switches again over its own message subset and returns
         // std::optional<LRESULT> — nullopt = unhandled, uniformly falls to DefWindowProc.
@@ -7005,6 +7135,12 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
             SetWindowLongPtrW(hwnd, GWLP_USERDATA,
                               reinterpret_cast<LONG_PTR>(wnd->impl_.get()));
             wnd->impl_->hwnd = hwnd;
+            // R19 (round-73): the hook observes WM_NCCREATE here — the only point where the
+            // instance state it lives on exists — but its return is ignored: this message
+            // binds the window's instance state and must never be swallowed (contract on
+            // Window::SetMessageHook).
+            if (wnd->impl_->messageHook)
+                (void)wnd->impl_->messageHook(msg, wParam, lParam);
             break;
         }
         }
@@ -9553,8 +9689,28 @@ void TextBox::OnPaint(Painter& p, const Theme& theme) {
     if (Focused() && !disabled && caretVisible_) {
         // caret takes the widget's text color: the baseline never sets caret-color ⇒ currentColor = --text1
         // (previously wrongly accent, round-17 I-06)
-        p.FillRect({ content.x + CaretX(caret_) - scrollX_, bounds_.y + 7,
-                     1, bounds_.h - 14 }, theme.controlText);
+        // R17 (round-73): the caret band follows the text's line box — the same metrics the
+        // VAlign::Center draw centers by (BaselineOffset's formula) — instead of a fixed ±7
+        // inset, which left a 10px caret under 12px text ink in a 24 DIP row. The band is
+        // measured on the string actually drawn (masked mode measures the dot string), so it
+        // stays aligned even when glyph fallback changes the line metrics; an empty box
+        // (no text, no placeholder) keeps the legacy band. At the default 32 DIP box this
+        // draws the line box the old 7/-14 constant approximated (≈18.6 DIP at 14px) — the
+        // caret becomes ≈0.6 DIP taller there, a deliberate sub-pixel appearance change.
+        const std::wstring_view caretText = text_.empty()
+            ? std::wstring_view{ placeholder_ }
+            : (password_ && !revealed_) ? MaskedText(text_.size())
+                                        : std::wstring_view{ text_ };
+        float caretY = bounds_.y + 7.0f, caretH = bounds_.h - 14.0f;
+        if (!caretText.empty()) {
+            DWRITE_TEXT_METRICS m = detail::MeasureTextMetrics(caretText, font_);
+            if (m.height > 0.0f) {
+                caretH = std::min(m.height, bounds_.h);
+                caretY = bounds_.y + std::max(0.0f, (bounds_.h - caretH) * 0.5f);
+            }
+        }
+        p.FillRect({ content.x + CaretX(caret_) - scrollX_, caretY,
+                     1, caretH }, theme.controlText);
     }
     p.PopClip();
 
@@ -12597,9 +12753,15 @@ void ScrollViewer::OnPostPaint(Painter& p, const Theme&) {
     p.PopClip();
     Rect tr = ThumbRect();
     if (tr.h <= 0) return;
+    // R20 (round-73): Hidden never draws; AutoHide draws with the fade alpha (a settled
+    // hidden state skips the fill entirely). Always keeps the exact 0.54.0 rendering.
+    if (barVisibility_ == ScrollBarVisibility::Hidden) return;
+    float shown = barVisibility_ == ScrollBarVisibility::AutoHide ? barAlpha_ : 1.0f;
+    if (shown <= 0.0f) return;
     // baseline scrollbar-color: rgba(128,128,128,.45) (hover .6 and widened to 8px),
     // neutral gray so the hue does not drift with the theme
-    Color c = Color::Rgb(0x808080, draggingThumb_ || thumbHover_ ? 0.6f : 0.45f);
+    Color c = Color::Rgb(0x808080,
+                         (draggingThumb_ || thumbHover_ ? 0.6f : 0.45f) * shown);
     if (draggingThumb_ || thumbHover_)
         p.FillRoundedRect({ tr.x - 1, tr.y, tr.w + 2, tr.h }, 4, c);
     else
@@ -12614,6 +12776,7 @@ bool ScrollViewer::OnWheel(float delta) {
     if (scrollY_ != old) {
         Relayout();
         Invalidate();
+        WakeScrollBar(kBarLingerFrames);   // R20: a scroll keeps the AutoHide bar up briefly
         if (OnScrolled) OnScrolled();
     }
     return true;
@@ -12624,6 +12787,7 @@ ScrollViewer& ScrollViewer::SetScrollOffset(float offset) {
     scrollY_ = std::clamp(offset, 0.0f, maxScroll);
     Relayout();
     Invalidate();
+    WakeScrollBar(kBarLingerFrames);   // R20: keyboard / programmatic scrolls show it too
     if (OnScrolled) OnScrolled();
 
     return *this;
@@ -12656,6 +12820,7 @@ ScrollViewer& ScrollViewer::ScrollToWidget(const Widget* target) {
     scrollY_ = std::clamp(offset, 0.0f, maxScroll);
     Relayout();
     Invalidate();
+    WakeScrollBar(kBarLingerFrames);   // R20: landing on a target shows it too
     if (OnScrolled) OnScrolled();
     return *this;
 }
@@ -12678,13 +12843,19 @@ void ScrollViewer::OnMouseLeave() {
 }
 
 void ScrollViewer::OnMouseDown(const Point& pos) {
+    // R20 (round-73): both the thumb grab and the track page band require the bar to be
+    // shown — an invisible scrollbar never eats a click (the click then simply does
+    // nothing here; the content above/below takes its own events as usual). Normal
+    // pointer interaction is unaffected: move precedes down, and the move already showed
+    // the bar (hover chain / linger).
     Rect tr = ThumbRect();
-    if (tr.w > 0 && pos.x >= tr.x - 2 && pos.x <= tr.Right() + 2 &&
+    if (tr.w > 0 && BarShown() &&
+        pos.x >= tr.x - 2 && pos.x <= tr.Right() + 2 &&
         pos.y >= tr.y - 2 && pos.y <= tr.Bottom() + 2) {
         draggingThumb_ = true;
         dragGrabOffset_ = pos.y - tr.y;
         Invalidate();
-    } else if (pos.x > viewport_.Right() - 14) {
+    } else if (BarShown() && pos.x > viewport_.Right() - 14) {
         // click the scrollbar track: page
         float maxScroll = std::max(0.0f, contentH_ - viewport_.h);
         SetScrollOffset(scrollY_ + (pos.y < tr.y ? -viewport_.h : viewport_.h) * 0.9f *
@@ -12693,7 +12864,86 @@ void ScrollViewer::OnMouseDown(const Point& pos) {
 }
 
 void ScrollViewer::OnMouseUp(const Point&) {
-    if (draggingThumb_) { draggingThumb_ = false; Invalidate(); }
+    if (draggingThumb_) {
+        draggingThumb_ = false;
+        Invalidate();
+        WakeScrollBar(0);   // R20: re-evaluate — the pointer may have left the port mid-drag
+    }
+}
+
+// ---- R20 (round-73): scrollbar visibility -----------------------------------------------
+
+bool ScrollViewer::BarShown() const {
+    switch (barVisibility_) {
+    case ScrollBarVisibility::AutoHide:
+        // pointer over the port (self or any descendant — descendants are hit-clipped to
+        // the viewport, so chain membership is exactly "pointer inside"), a drag in
+        // progress, a recent scroll, or keyboard focus. barAlpha_ is deliberately NOT a
+        // condition: it is the value following this target, never part of it.
+        return hoverLit_ || draggingThumb_ || barLinger_ > 0 || Focused();
+    case ScrollBarVisibility::Hidden:
+        return false;
+    case ScrollBarVisibility::Always: break;
+    }
+    return true;
+}
+
+void ScrollViewer::WakeScrollBar(int lingerFrames) {
+    if (barVisibility_ != ScrollBarVisibility::AutoHide) return;
+    barLinger_ = lingerFrames;
+    StartAnimation();   // repeat calls are no-ops; OnAnimate settles and stops dispatch
+}
+
+void ScrollViewer::OnAnimate() {
+    // AutoHide fade: re-evaluate the visibility target every frame so the bar follows
+    // pointer / linger / drag / focus state, then step the alpha ≈150ms end-to-end at the
+    // 30fps dispatch. Dispatch stops once settled and the linger window has closed; the
+    // next wake restarts it. Pixels only move while the alpha moves (the linger countdown
+    // itself paints nothing new).
+    if (barLinger_ > 0) --barLinger_;
+    float target = BarShown() ? 1.0f : 0.0f;
+    bool moved = false;
+    if (barAlpha_ < target) {
+        barAlpha_ = std::min(target, barAlpha_ + 0.18f);
+        moved = true;
+    } else if (barAlpha_ > target) {
+        barAlpha_ = std::max(target, barAlpha_ - 0.18f);
+        moved = true;
+    }
+    if (moved) Invalidate();
+    if (barAlpha_ == target && barLinger_ == 0) StopAnimation();
+}
+
+void ScrollViewer::OnHoverChainChanged(bool) {
+    // pointer entered/left the scroll area: enter fades the bar in, leave fades it out
+    // unless a drag / linger / keyboard focus holds it up
+    WakeScrollBar(0);
+}
+
+void ScrollViewer::OnFocused() {
+    WakeScrollBar(0);   // keyboard users must see that this pane scrolls
+}
+
+void ScrollViewer::OnUnfocused() {
+    WakeScrollBar(0);
+}
+
+ScrollViewer& ScrollViewer::SetScrollBarVisibility(ScrollBarVisibility v) {
+    if (barVisibility_ == v) return *this;
+    barVisibility_ = v;
+    barLinger_ = 0;
+    StopAnimation();
+    if (v == ScrollBarVisibility::Always) {
+        barAlpha_ = 1.0f;
+    } else {
+        // AutoHide/Hidden start from the hidden side; an AutoHide viewer with the pointer
+        // already inside fades in right away (BarShown reads the live hover chain)
+        barAlpha_ = 0.0f;
+        if (v == ScrollBarVisibility::AutoHide && BarShown()) StartAnimation();
+    }
+    Invalidate();
+
+    return *this;
 }
 
 // ---------------------------------------------------------------------------
@@ -13876,6 +14126,20 @@ bool Window::RoundedCorners() const {
                       detail::kDwmwaWindowCornerPreference,
                       &pref, sizeof(pref))) &&
            pref == detail::kDwmwcpRound;
+}
+
+HWND Window::NativeHandle() const {
+    // R18 (round-73): the live HWND; nullptr once WM_DESTROY cleared it (Close / destructor
+    // started) or when creation failed (LastError). Read-only hand-off — the contract,
+    // including the no-subclassing boundary, lives on the declaration.
+    if (!impl_) return nullptr;
+    return impl_->hwnd;
+}
+
+Window& Window::SetMessageHook(MessageHook hook) {
+    impl_->messageHook = std::move(hook);
+
+    return *this;
 }
 
 void Window::Close() {
