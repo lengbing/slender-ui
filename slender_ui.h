@@ -174,10 +174,20 @@
 /// UNIFORM line spacing instead of clipping into the one-line-height popup; the widest
 /// segment also drives the width for CRLF text ('\r' trimmed). A '\n'-free tooltip
 /// measures and draws exactly as 0.55.0.
+/// 0.56.0 = consumer-requirement round 13 (round-75): R22 — vector paths bake into
+/// window icons. MakeIconFromPath(svgPathD, px, tint) renders a 24-unit d-attribute path
+/// tinted with one color into an HICON (the MakeBadgeIcon pipeline: DC render target +
+/// DIB, premultiplied BGRA, caller DestroyIcon); MakeBadgeIcon itself moves from
+/// slender::detail to the public slender scope (the documented call sites already
+/// qualified it publicly). Window::SetIcon(const Icon&, const Color&) bakes both system
+/// tiers at the window's DPI, re-bakes on DPI change and owns its handles; an empty icon
+/// restores the letter-badge default. TitleBar::SetBadgeIcon(const Icon&) replaces the
+/// badge's first-letter ink with the vector glyph (16 DIP ink box in the 20 DIP
+/// gradient square, textOnAccent tint, dimmed with the bar); empty restores the letter.
 #define SLENDER_UI_VERSION_MAJOR 0
-#define SLENDER_UI_VERSION_MINOR 55
-#define SLENDER_UI_VERSION_PATCH 1
-#define SLENDER_UI_VERSION "0.55.1"
+#define SLENDER_UI_VERSION_MINOR 56
+#define SLENDER_UI_VERSION_PATCH 0
+#define SLENDER_UI_VERSION "0.56.0"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
@@ -328,6 +338,9 @@ public:
 
 private:
     friend class RenderPainter;
+    // R22: the window's icon bake re-rasterizes this icon at the system icon tiers (WM_SETICON
+    // big/small) and re-bakes on DPI change — SetIcon(const Icon&, const Color&).
+    template <class W> friend struct detail::WindowIconOps;
     std::shared_ptr<detail::IconData> data_;
 };
 
@@ -1226,6 +1239,14 @@ public:
     TitleBar& SetBadgeVisible(bool visible);
     bool BadgeVisible() const { return badgeVisible_; }
 
+    /// Replaces the badge's first-letter ink with the given vector icon (R22): the gradient
+    /// square stays, the glyph draws tinted textOnAccent (dimmed with the bar like every other
+    /// title element) fitted into the 20 DIP box. An empty icon (the default) restores the
+    /// letter badge. Paint-only — geometry, HTSYSMENU and the window/taskbar icon are
+    /// unaffected (pair with Window::SetIcon(const Icon&, const Color&) for that).
+    TitleBar& SetBadgeIcon(const Icon& icon);
+    const Icon& BadgeIcon() const { return badgeIcon_; }
+
     /// Configures which built-in system buttons are shown (default WindowButtons::Default).
     /// Visibility only; the maximize behavior is Window::SetMaximizable's concern.
     TitleBar& SetSystemButtons(WindowButtons buttons);
@@ -1330,6 +1351,7 @@ private:
     int captionPressed_ = 0;      // hit code of the pressed button, 0 means none (R32-01/05)
     WindowButtons systemButtons_ = WindowButtons::Default;
     bool badgeVisible_ = true;
+    Icon badgeIcon_;              // R22: empty (default) = draw the first-letter badge; else the glyph replaces the letter
     std::vector<CaptionButton> customButtons_;   // insertion order = left-to-right
     int customHover_ = -1;        // index into customButtons_, -1 = none
     int customPressed_ = -1;      // index of the pressed custom button, -1 = none
@@ -2881,6 +2903,16 @@ public:
     /// the default icon.
     Window& SetIcon(HICON iconBig, HICON iconSmall = nullptr);
 
+    /// Sets the window icon from a vector icon (R22): bakes both system tiers (SM_CXICON /
+    /// SM_CXSMICON at the window's current DPI) from the icon's 24-unit path, tinted with the
+    /// single color `tint` (pass a theme token such as theme.titleText to follow the theme),
+    /// and installs them as the user icon. The baked handles are library-owned — they are
+    /// re-baked on DPI change and destroyed at restore/destruction; the icon object itself is
+    /// not retained beyond the bake. An empty icon restores the library default (letter
+    /// badge), same as SetIcon(nullptr, nullptr). The title-bar badge is a separate surface —
+    /// pair with TitleBar::SetBadgeIcon. Requires a created window (like the HICON overload).
+    Window& SetIcon(const Icon& icon, const Color& tint);
+
     /// Adds a widget, returns the reference (the window owns the widget).
     template <class T, class... Args>
     T& Add(Args&&... args);
@@ -4130,6 +4162,76 @@ private:
     int cur_ = -1;
 };
 
+/// R22: bakes vector-path figures into an HICON of the given pixel size — the 24-unit viewbox
+/// is scaled to fit the px box and the geometry is filled with a single tint on a transparent
+/// background (the same DC render target + DIB pipeline as MakeBadgeIcon: premultiplied BGRA,
+/// no COM/WIC anywhere). The caller owns the returned handle and must DestroyIcon it; nullptr
+/// on empty geometry, a missing device, or a failed frame (R35-01: EndDraw's result is consumed).
+inline HICON BakePathIcon(IconData& data, int px, const Color& tint) {
+    if (px <= 0 || data.figures.empty() || !g_d2d) return nullptr;
+    ID2D1PathGeometry* geo = data.GetGeometry();
+    if (!geo) return nullptr;
+    ComPtr<ID2D1DCRenderTarget> rt;
+    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    if (FAILED(g_d2d->CreateDCRenderTarget(&props, rt.GetAddressOf()))) return nullptr;
+    rt->SetDpi(96.0f, 96.0f);   // draw in raw pixel space, no system DPI scaling
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = px;
+    bi.bmiHeader.biHeight = -px;    // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib || !bits) {
+        if (dib) DeleteObject(dib);
+        ReleaseDC(nullptr, screen);
+        return nullptr;
+    }
+    HDC mem = CreateCompatibleDC(screen);
+    ReleaseDC(nullptr, screen);
+    HBITMAP old = static_cast<HBITMAP>(SelectObject(mem, dib));
+    RECT rc{ 0, 0, px, px };
+    HRESULT hr = rt->BindDC(mem, &rc);
+    if (SUCCEEDED(hr)) {
+        rt->BeginDraw();
+        float scale = static_cast<float>(px) / 24.0f;
+        ComPtr<ID2D1SolidColorBrush> ink;
+        if (SUCCEEDED(rt->CreateSolidColorBrush(ToD2D(tint), ink.GetAddressOf()))) {
+            // same fit-and-center transform as RenderPainter::DrawIcon, minus the centering
+            // (the icon box is exactly the viewbox aspect here)
+            rt->SetTransform(D2D1::Matrix3x2F::Scale(D2D1::SizeF(scale, scale)));
+            rt->FillGeometry(geo, ink.Get());
+            rt->SetTransform(D2D1::Matrix3x2F::Identity());
+        }
+        // R35-01: the EndDraw return value must be consumed — any drawing error inside a D2D
+        // frame ⇒ drop the whole frame; without checking this HRESULT an all-zero DIB still
+        // gets baked into a fully transparent icon by CreateIconIndirect
+        hr = rt->EndDraw();
+    }
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    if (FAILED(hr)) { DeleteObject(dib); return nullptr; }
+
+    // 32bpp α icons still need a monochrome mask (all 0 = whole rows opaque; the α channel takes over)
+    std::vector<BYTE> zeros(static_cast<size_t>((px + 7) / 8) * px, 0);
+    HBITMAP mask = CreateBitmap(px, px, 1, 1, zeros.data());
+    if (!mask) { DeleteObject(dib); return nullptr; }
+    ICONINFO ii{};
+    ii.fIcon = TRUE;
+    ii.hbmMask = mask;
+    ii.hbmColor = dib;
+    HICON icon = CreateIconIndirect(&ii);   // the system copies the bitmaps; the originals remain ours to release
+    DeleteObject(dib);
+    DeleteObject(mask);
+    return icon;
+}
+
 } // namespace detail
 
 inline Icon Icon::FromSvgPath(std::string_view pathData) {
@@ -4158,6 +4260,123 @@ Icon& Icon::operator=(const Icon&) = default;
 Icon::Icon(Icon&&) noexcept = default;
 Icon& Icon::operator=(Icon&&) noexcept = default;
 bool Icon::IsEmpty() const { return !data_ || data_->figures.empty(); }
+
+/// Bakes a "gradient rounded square + title first letter" badge into an HICON of the given pixel size (R34-02).
+/// Same source as TitleBar::OnPaint's owner-drawn badge: 20 DIP box / radius 6 / 12 DIP bold letter.
+/// The D2D DC render target's premultiplied-α output is exactly the 32bpp icon format; no COM/WIC anywhere.
+/// letter takes the full code point (1–2 UTF-16 code units, R36-05b).
+inline HICON MakeBadgeIcon(std::wstring_view letter, int px, const Theme& theme) {
+    if (px <= 0 || !g_d2d || !g_dwrite) return nullptr;
+    detail::ComPtr<ID2D1DCRenderTarget> rt;
+    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    if (FAILED(g_d2d->CreateDCRenderTarget(&props, rt.GetAddressOf()))) return nullptr;
+    rt->SetDpi(96.0f, 96.0f);   // draw in raw pixel space, no system DPI scaling
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = px;
+    bi.bmiHeader.biHeight = -px;    // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib || !bits) {
+        if (dib) DeleteObject(dib);
+        ReleaseDC(nullptr, screen);
+        return nullptr;
+    }
+    HDC mem = CreateCompatibleDC(screen);
+    ReleaseDC(nullptr, screen);
+    HBITMAP old = static_cast<HBITMAP>(SelectObject(mem, dib));
+    RECT rc{ 0, 0, px, px };
+    HRESULT hr = rt->BindDC(mem, &rc);
+    if (SUCCEEDED(hr)) {
+        rt->BeginDraw();
+        float f = static_cast<float>(px);
+        D2D1_GRADIENT_STOP stops[2]{
+            { 0.0f, detail::ToD2D(theme.accentHover) }, { 1.0f, detail::ToD2D(theme.accent) } };
+        detail::ComPtr<ID2D1GradientStopCollection> col;
+        detail::ComPtr<ID2D1LinearGradientBrush> brush;
+        if (SUCCEEDED(rt->CreateGradientStopCollection(
+                stops, 2, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP,
+                col.GetAddressOf())) &&
+            SUCCEEDED(rt->CreateLinearGradientBrush(
+                D2D1::LinearGradientBrushProperties(
+                    D2D1::Point2F(0, 0), D2D1::Point2F(0, f)),
+                col.Get(), brush.GetAddressOf()))) {
+            float radius = f * 6.0f / 20.0f;
+            rt->FillRoundedRectangle(
+                D2D1::RoundedRect(D2D1::RectF(0, 0, f, f), radius, radius),
+                brush.Get());
+            // Title first letter (first available family of the badge's font stack + bold). The family name must go through
+            // EffectiveFontFamily/ResolveFontFamily: since round-43 Font{}.family
+            // is always empty; reading it directly hands an empty family to DWrite's layout-time fallback — the icon
+            // still gets glyphs but in a different font, no longer matching the owner-drawn badge (PERF44-01, round-44
+            // A/B measured 3.3% pixel delta at 32px). Library reads of family must not bypass this resolution.
+            std::wstring family =
+                detail::ResolveFontFamily(detail::EffectiveFontFamily(std::wstring{}));
+            size_t semi = family.find(L';');
+            if (semi != std::wstring::npos) family.resize(semi);
+            detail::ComPtr<IDWriteTextFormat> format;
+            detail::ComPtr<IDWriteTextLayout> layout;
+            // ARCH39-06: when g_dwrite has been Reset (out-of-contract call after Shutdown), skip the glyph
+            if (g_dwrite && SUCCEEDED(g_dwrite->CreateTextFormat(
+                    family.c_str(), nullptr, DWRITE_FONT_WEIGHT_BOLD,
+                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                    f * 12.0f / 20.0f, L"en-us", format.GetAddressOf())) &&
+                SUCCEEDED(g_dwrite->CreateTextLayout(
+                    letter.data(), static_cast<UINT32>(letter.size()),
+                    format.Get(), f, f, layout.GetAddressOf()))) {
+                DWRITE_TEXT_METRICS tm{};
+                layout->GetMetrics(&tm);
+                detail::ComPtr<ID2D1SolidColorBrush> ink;
+                if (SUCCEEDED(rt->CreateSolidColorBrush(detail::ToD2D(theme.textOnAccent),
+                                                        ink.GetAddressOf())))
+                    rt->DrawTextLayout(
+                        D2D1::Point2F((f - tm.width) * 0.5f, (f - tm.height) * 0.5f),
+                        layout.Get(), ink.Get());
+            }
+        }
+        // R35-01: the EndDraw return value must be consumed — any drawing error inside a D2D frame ⇒ drop the whole frame;
+        // without checking this HRESULT an all-zero DIB still gets baked into a fully transparent icon by CreateIconIndirect
+        hr = rt->EndDraw();
+    }
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    if (FAILED(hr)) { DeleteObject(dib); return nullptr; }
+
+    // 32bpp α icons still need a monochrome mask (all 0 = whole rows opaque; the α channel takes over)
+    std::vector<BYTE> zeros(static_cast<size_t>((px + 7) / 8) * px, 0);
+    HBITMAP mask = CreateBitmap(px, px, 1, 1, zeros.data());
+    if (!mask) { DeleteObject(dib); return nullptr; }
+    ICONINFO ii{};
+    ii.fIcon = TRUE;
+    ii.hbmMask = mask;
+    ii.hbmColor = dib;
+    HICON icon = CreateIconIndirect(&ii);   // the system copies the bitmaps; the originals remain ours to release
+    DeleteObject(dib);
+    DeleteObject(mask);
+    return icon;
+}
+
+/// Bakes an SVG path (the d attribute content, 24×24 viewbox — the same input Icon::FromSvgPath
+/// takes) into an HICON of the given pixel size (R22): the path is scaled to fit the box and
+/// filled with the single tint on a transparent background (pass a theme token such as
+/// theme.titleText to follow the theme). Premultiplied BGRA output; the caller owns the handle
+/// and must DestroyIcon it. Returns nullptr on a parse failure, px <= 0, a missing device, or a
+/// failed frame. For window icons prefer Window::SetIcon(const Icon&, const Color&), which
+/// bakes both system tiers (SM_CXICON/SM_CXSMICON at the window's DPI) and re-bakes on DPI change.
+inline HICON MakeIconFromPath(std::string_view svgPathD, int px, const Color& tint) {
+    if (px <= 0 || !g_d2d) return nullptr;
+    detail::IconData data;
+    detail::SvgPathParser parser(svgPathD);
+    if (!parser.Parse(data) || data.figures.empty()) return nullptr;
+    return detail::BakePathIcon(data, px, tint);
+}
 
 // ---------------------------------------------------------------------------
 // RenderPainter: D2D implementation of the Painter interface (framework-internal)
@@ -5953,108 +6172,6 @@ private:
 /// Whether focus came from the keyboard (set on WM_KEYDOWN, cleared on mouse-down): only keyboard navigation draws the focus ring.
 inline bool g_focusFromKeyboard = false;
 
-/// Bakes a "gradient rounded square + title first letter" badge into an HICON of the given pixel size (R34-02).
-/// Same source as TitleBar::OnPaint's owner-drawn badge: 20 DIP box / radius 6 / 12 DIP bold letter.
-/// The D2D DC render target's premultiplied-α output is exactly the 32bpp icon format; no COM/WIC anywhere.
-/// letter takes the full code point (1–2 UTF-16 code units, R36-05b).
-inline HICON MakeBadgeIcon(std::wstring_view letter, int px, const Theme& theme) {
-    if (px <= 0 || !g_d2d || !g_dwrite) return nullptr;
-    ComPtr<ID2D1DCRenderTarget> rt;
-    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
-        D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-    if (FAILED(g_d2d->CreateDCRenderTarget(&props, rt.GetAddressOf()))) return nullptr;
-    rt->SetDpi(96.0f, 96.0f);   // draw in raw pixel space, no system DPI scaling
-
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = px;
-    bi.bmiHeader.biHeight = -px;    // top-down
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HDC screen = GetDC(nullptr);
-    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!dib || !bits) {
-        if (dib) DeleteObject(dib);
-        ReleaseDC(nullptr, screen);
-        return nullptr;
-    }
-    HDC mem = CreateCompatibleDC(screen);
-    ReleaseDC(nullptr, screen);
-    HBITMAP old = static_cast<HBITMAP>(SelectObject(mem, dib));
-    RECT rc{ 0, 0, px, px };
-    HRESULT hr = rt->BindDC(mem, &rc);
-    if (SUCCEEDED(hr)) {
-        rt->BeginDraw();
-        float f = static_cast<float>(px);
-        D2D1_GRADIENT_STOP stops[2]{
-            { 0.0f, ToD2D(theme.accentHover) }, { 1.0f, ToD2D(theme.accent) } };
-        ComPtr<ID2D1GradientStopCollection> col;
-        ComPtr<ID2D1LinearGradientBrush> brush;
-        if (SUCCEEDED(rt->CreateGradientStopCollection(
-                stops, 2, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP,
-                col.GetAddressOf())) &&
-            SUCCEEDED(rt->CreateLinearGradientBrush(
-                D2D1::LinearGradientBrushProperties(
-                    D2D1::Point2F(0, 0), D2D1::Point2F(0, f)),
-                col.Get(), brush.GetAddressOf()))) {
-            float radius = f * 6.0f / 20.0f;
-            rt->FillRoundedRectangle(
-                D2D1::RoundedRect(D2D1::RectF(0, 0, f, f), radius, radius),
-                brush.Get());
-            // Title first letter (first available family of the badge's font stack + bold). The family name must go through
-            // EffectiveFontFamily/ResolveFontFamily: since round-43 Font{}.family
-            // is always empty; reading it directly hands an empty family to DWrite's layout-time fallback — the icon
-            // still gets glyphs but in a different font, no longer matching the owner-drawn badge (PERF44-01, round-44
-            // A/B measured 3.3% pixel delta at 32px). Library reads of family must not bypass this resolution.
-            std::wstring family =
-                ResolveFontFamily(EffectiveFontFamily(std::wstring{}));
-            size_t semi = family.find(L';');
-            if (semi != std::wstring::npos) family.resize(semi);
-            ComPtr<IDWriteTextFormat> format;
-            ComPtr<IDWriteTextLayout> layout;
-            // ARCH39-06: when g_dwrite has been Reset (out-of-contract call after Shutdown), skip the glyph
-            if (g_dwrite && SUCCEEDED(g_dwrite->CreateTextFormat(
-                    family.c_str(), nullptr, DWRITE_FONT_WEIGHT_BOLD,
-                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                    f * 12.0f / 20.0f, L"en-us", format.GetAddressOf())) &&
-                SUCCEEDED(g_dwrite->CreateTextLayout(
-                    letter.data(), static_cast<UINT32>(letter.size()),
-                    format.Get(), f, f, layout.GetAddressOf()))) {
-                DWRITE_TEXT_METRICS tm{};
-                layout->GetMetrics(&tm);
-                ComPtr<ID2D1SolidColorBrush> ink;
-                if (SUCCEEDED(rt->CreateSolidColorBrush(ToD2D(theme.textOnAccent),
-                                                        ink.GetAddressOf())))
-                    rt->DrawTextLayout(
-                        D2D1::Point2F((f - tm.width) * 0.5f, (f - tm.height) * 0.5f),
-                        layout.Get(), ink.Get());
-            }
-        }
-        // R35-01: the EndDraw return value must be consumed — any drawing error inside a D2D frame ⇒ drop the whole frame;
-        // without checking this HRESULT an all-zero DIB still gets baked into a fully transparent icon by CreateIconIndirect
-        hr = rt->EndDraw();
-    }
-    SelectObject(mem, old);
-    DeleteDC(mem);
-    if (FAILED(hr)) { DeleteObject(dib); return nullptr; }
-
-    // 32bpp α icons still need a monochrome mask (all 0 = whole rows opaque; the α channel takes over)
-    std::vector<BYTE> zeros(static_cast<size_t>((px + 7) / 8) * px, 0);
-    HBITMAP mask = CreateBitmap(px, px, 1, 1, zeros.data());
-    if (!mask) { DeleteObject(dib); return nullptr; }
-    ICONINFO ii{};
-    ii.fIcon = TRUE;
-    ii.hbmMask = mask;
-    ii.hbmColor = dib;
-    HICON icon = CreateIconIndirect(&ii);   // the system copies the bitmaps; the originals remain ours to release
-    DeleteObject(dib);
-    DeleteObject(mask);
-    return icon;
-}
-
     // ======================================================================
     // ARCH58-01 stage 2: class-level split of WindowImpl by concern (CRTP ops bases).
     // Each base holds one concern's members and methods and reaches the core state through the impl() back-reference
@@ -6525,6 +6642,14 @@ public:
     uint32_t iconKeyHover = 0;
     uint32_t iconKeyOnAccent = 0;
     bool iconUser = false;
+    // R22: a user icon baked from a vector Icon source (SetIcon(const Icon&, const Color&)) —
+    // unlike raw HICON user icons (caller-owned, never touched again) these handles are
+    // library-owned: re-baked from iconSource/iconTint on DPI change, destroyed when superseded,
+    // at restore-to-default, and at window destruction.
+    Icon iconSource;
+    Color iconTint{};
+    HICON bakedUserBig = nullptr;
+    HICON bakedUserSmall = nullptr;
     // GAP48-01/PERF48-01: baked-icon cache. Once a library-generated icon is installed via WM_SETICON,
     // its handle is owned by this cache until window destruction; replacement installs without destroying — the old
     // "DestroyIcon first, then WM_SETICON" left the window briefly holding a freed handle; re-entry with the same key
@@ -6624,6 +6749,28 @@ public:
             }
             if (!evicted) break;
         }
+    }
+
+    /// R22: (re)bake big+small tiers from iconSource/iconTint at the window's current DPI and
+    /// install; a failed bake keeps the current handles (GAP48-01's "never blank the window").
+    /// Old handles are destroyed only after the new ones are installed — the window never
+    /// holds a freed handle. smallIcon must not be named "small" (rpcndr.h macro).
+    void RebakeUserSourceIcon() {
+        if (!impl()->hwnd || iconSource.IsEmpty()) return;
+        UINT iconDpi = GetDpiForWindow(impl()->hwnd);
+        UINT pxBig = static_cast<UINT>(GetSystemMetricsForDpi(SM_CXICON, iconDpi));
+        UINT pxSmall = static_cast<UINT>(GetSystemMetricsForDpi(SM_CXSMICON, iconDpi));
+        HICON bigIcon = detail::BakePathIcon(*iconSource.data_, static_cast<int>(pxBig), iconTint);
+        HICON smallIcon = detail::BakePathIcon(*iconSource.data_, static_cast<int>(pxSmall), iconTint);
+        if (!bigIcon && !smallIcon) return;
+        SendMessageW(impl()->hwnd, WM_SETICON, ICON_BIG,
+                     (LPARAM)(bigIcon ? bigIcon : smallIcon));
+        SendMessageW(impl()->hwnd, WM_SETICON, ICON_SMALL,
+                     (LPARAM)(smallIcon ? smallIcon : (bigIcon ? bigIcon : smallIcon)));
+        if (bakedUserBig) DestroyIcon(bakedUserBig);
+        if (bakedUserSmall && bakedUserSmall != bakedUserBig) DestroyIcon(bakedUserSmall);
+        bakedUserBig = bigIcon ? bigIcon : smallIcon;
+        bakedUserSmall = smallIcon ? smallIcon : bakedUserBig;
     }
 };
 
@@ -7781,6 +7928,7 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
             // user icons (iconUser) are protected by RefreshIcon's own early-out
             impl->iconLetter.clear();
             impl->RefreshIcon();
+            impl->RebakeUserSourceIcon();   // R22: Icon-sourced user icons re-tier at the new DPI (no-op otherwise)
             if (impl->rt.ctx) {
                 RECT rc;
                 GetClientRect(hwnd, &rc);
@@ -8066,6 +8214,11 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
                 for (auto& e : impl->iconCache_) DestroyIcon(e.icon);
                 impl->iconCache_.clear();
                 impl->generatedIconBig = impl->generatedIconSmall = nullptr;
+                // R22: Icon-sourced user bakes are library-owned and die with the window
+                if (impl->bakedUserBig) DestroyIcon(impl->bakedUserBig);
+                if (impl->bakedUserSmall && impl->bakedUserSmall != impl->bakedUserBig)
+                    DestroyIcon(impl->bakedUserSmall);
+                impl->bakedUserBig = impl->bakedUserSmall = nullptr;
                 for (size_t i = 0; i < g_windows.size(); ++i) {
                     if (g_windows[i] == impl->owner) {
                         g_windows.erase(g_windows.begin() + i);
@@ -8239,6 +8392,13 @@ TitleBar& TitleBar::SetBadgeVisible(bool visible) {
     return *this;
 }
 
+TitleBar& TitleBar::SetBadgeIcon(const Icon& icon) {
+    badgeIcon_ = icon;   // Icon has no identity comparison (data_ is private); an extra Invalidate is cheap
+    Invalidate();
+
+    return *this;
+}
+
 TitleBar& TitleBar::SetSystemButtons(WindowButtons buttons) {
     if (systemButtons_ != buttons) {
         systemButtons_ = buttons;
@@ -8395,11 +8555,18 @@ void TitleBar::OnPaint(Painter& p, const Theme& theme) {
     Rect badge = BadgeRect();
     if (badgeVisible_) {
         p.FillRoundedRectGradient(badge, 6, dim(theme.accentHover), dim(theme.accent));
-        wchar_t letter = text_.empty() ? L'S' : text_.front();
-        wchar_t letterText[2] = { letter, L'\0' };
-        p.DrawText(std::wstring_view(letterText, 1),
-                   Font{ .size = 12.0f, .weight = FontWeight::Bold },
-                   badge, dim(theme.textOnAccent), HAlign::Center, VAlign::Center);
+        if (!badgeIcon_.IsEmpty()) {
+            // R22: custom vector glyph instead of the letter — same ink box the caption
+            // buttons use (16 DIP), centered in the 20 DIP square, dimmed like the letter
+            p.DrawIcon(badgeIcon_, { badge.x + 2, badge.y + 2, 16, 16 },
+                       dim(theme.textOnAccent));
+        } else {
+            wchar_t letter = text_.empty() ? L'S' : text_.front();
+            wchar_t letterText[2] = { letter, L'\0' };
+            p.DrawText(std::wstring_view(letterText, 1),
+                       Font{ .size = 12.0f, .weight = FontWeight::Bold },
+                       badge, dim(theme.textOnAccent), HAlign::Center, VAlign::Center);
+        }
     }
 
     // window title (right side reserved for the visible caption buttons: system + custom)
@@ -13965,6 +14132,13 @@ Window& Window::SetIcon(HICON iconBig, HICON iconSmall) {
         return *this;               // STY48-01: indentation aligned (the original 4 spaces misled)
     }
     impl_->iconUser = true;
+    // R22: a prior Icon-sourced bake is superseded by raw user handles — its library-owned
+    // icons die here (the replacements are already installed on the window)
+    if (impl_->bakedUserBig) DestroyIcon(impl_->bakedUserBig);
+    if (impl_->bakedUserSmall && impl_->bakedUserSmall != impl_->bakedUserBig)
+        DestroyIcon(impl_->bakedUserSmall);
+    impl_->bakedUserBig = impl_->bakedUserSmall = nullptr;
+    impl_->iconSource = Icon{};
     // GAP48-01: install the user icon first; library-generated icons are not destroyed — still owned by iconCache_
     // for reuse when restoring the default, so the window holds valid handles at any moment (the old way DestroyIcon'd
     // first then WM_SETICON, briefly holding freed handles)
@@ -13977,6 +14151,27 @@ Window& Window::SetIcon(HICON iconBig, HICON iconSmall) {
                  (LPARAM)(iconSmall ? iconSmall : iconBig));
     impl_->generatedIconBig = impl_->generatedIconSmall = nullptr;   // aliases voided (ownership stays with the cache)
     impl_->iconLetter.clear();
+
+    return *this;
+}
+
+Window& Window::SetIcon(const Icon& icon, const Color& tint) {
+    if (!impl_ || !impl_->hwnd) return *this;
+    if (icon.IsEmpty()) {   // R22: empty source = restore the library default (letter badge)
+        if (impl_->bakedUserBig) DestroyIcon(impl_->bakedUserBig);
+        if (impl_->bakedUserSmall && impl_->bakedUserSmall != impl_->bakedUserBig)
+            DestroyIcon(impl_->bakedUserSmall);
+        impl_->bakedUserBig = impl_->bakedUserSmall = nullptr;
+        impl_->iconSource = Icon{};
+        impl_->iconUser = false;
+        impl_->iconLetter.clear();
+        impl_->RefreshIcon();
+        return *this;
+    }
+    impl_->iconUser = true;
+    impl_->iconSource = icon;
+    impl_->iconTint = tint;
+    impl_->RebakeUserSourceIcon();
 
     return *this;
 }
