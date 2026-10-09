@@ -136,10 +136,20 @@
 /// commit-and-rebuild flows cannot double-fire). Window::SetSizeChangedHandler — the client
 /// DIP size actually changed, fired after layout is current; SIZE_MINIMIZED and DPI-only
 /// rescales never fire.
+/// 0.53.1 = consumer-requirement round 7 (round-71): R14 — SetFocused no longer writes a
+/// target the blur callbacks detached. The old widget's public callbacks (OnUnfocused /
+/// TextBox::OnFocusLost) may legitimately rebuild the tree (blur-commit-rebuild), which
+/// can detach the new target: the pre-callback pointer was re-installed unconditionally,
+/// and FlushPendingDestroy's root-equality heal cannot reach a target nested inside a
+/// rebuilt row (next input = use-after-free, consumer crash 0xC0000005). The target is
+/// now re-validated with the click path's own ARCH39-01 criterion (window_ non-null) —
+/// a detached target is dropped and focus lands nowhere; DetachTree likewise clears
+/// `captured` subtree-wide (the R10 hover / R12 focus contract), so WM_LBUTTONUP /
+/// WM_CAPTURECHANGED can never dereference a detached widget.
 #define SLENDER_UI_VERSION_MAJOR 0
 #define SLENDER_UI_VERSION_MINOR 53
-#define SLENDER_UI_VERSION_PATCH 0
-#define SLENDER_UI_VERSION "0.53.0"
+#define SLENDER_UI_VERSION_PATCH 1
+#define SLENDER_UI_VERSION "0.53.1"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
@@ -6032,6 +6042,16 @@ public:
             if (auto* tb = dynamic_cast<TextBox*>(focused))
                 if (tb->OnFocusLost) tb->OnFocusLost();
         }
+        // R14: the callbacks above may legitimately mutate the tree (blur-commit-rebuild:
+        // the whole list is rebuilt from inside TextBox::OnFocusLost), and the new target
+        // may have gone down with it. DetachTree already cleared `focused` for everything
+        // it detached, so re-writing the pre-callback target here would resurrect a
+        // detached pointer — and FlushPendingDestroy only heals bare pointers that EQUAL
+        // a queued subtree root, so a target nested inside a rebuilt row is never healed
+        // (the next input dereferences freed memory). Same window_ guard as the click
+        // path (ARCH39-01): a detached widget must not become focused and must not
+        // receive OnFocused; focus simply lands nowhere.
+        if (widget && !widget->window_) widget = nullptr;
         focused = widget;
         if (widget) widget->OnFocused();
         impl()->Invalidate();
@@ -6619,7 +6639,13 @@ struct WindowImpl : WindowDialogOps<WindowImpl>, WindowFocusOps<WindowImpl>,
             focused->OnUnfocused();
             focused = nullptr;
         }
-        if (captured == w) {
+        if (captured && InSubtree(captured, w)) {
+            // R14: subtree-wide, same contract as focus (R12) and hover (R10) — the rebuild
+            // flows that detach the focused widget equally detach the captured one, and a
+            // nested captured widget is not healed by FlushPendingDestroy (only queued
+            // subtree roots are), leaving WM_LBUTTONUP / WM_CAPTURECHANGED to dereference
+            // freed memory. Capture is dropped without OnCaptureLost: the widget is going
+            // away, and this mirrors the root-detach case that already behaved this way.
             captured = nullptr;
             if (hwnd) ReleaseCapture();
         }
