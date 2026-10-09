@@ -146,10 +146,21 @@
 /// a detached target is dropped and focus lands nowhere; DetachTree likewise clears
 /// `captured` subtree-wide (the R10 hover / R12 focus contract), so WM_LBUTTONUP /
 /// WM_CAPTURECHANGED can never dereference a detached widget.
+/// 0.54.0 = consumer-requirement round 8 (round-72): text decorations (R15) and button
+/// icon color/centering (R16). Font gains strikethrough/underline — drawn by DWrite
+/// (IDWriteTextLayout::SetStrikethrough/SetUnderline) with the run font's own metrics and
+/// the run's text color, applied wherever the font draws (Label convenience setters
+/// SetStrikethrough/SetUnderline included); the line covers exactly the drawn run, so it
+/// coexists with ellipsis truncation. Button::SetTextColorOverride now takes
+/// std::optional<Color> ({}/nullopt clears — the old const Color& signature turned a
+/// {} clear into opaque black) plus ClearTextColorOverride, and also colors IconOnly
+/// buttons' icons (previously hardcoded theme.text there); a non-IconOnly button with an
+/// icon but empty text centers the bare 16px icon (the 8px icon-text gap no longer
+/// pushes it 4px left of the box center).
 #define SLENDER_UI_VERSION_MAJOR 0
-#define SLENDER_UI_VERSION_MINOR 53
-#define SLENDER_UI_VERSION_PATCH 1
-#define SLENDER_UI_VERSION "0.53.1"
+#define SLENDER_UI_VERSION_MINOR 54
+#define SLENDER_UI_VERSION_PATCH 0
+#define SLENDER_UI_VERSION "0.54.0"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
@@ -247,6 +258,13 @@ struct Font {
     FontWeight weight = FontWeight::Normal;
     float lineHeight = 0.0f;       ///< line-height multiple (0 = DWrite default; reference: body 1.5, hero 1.7)
     bool tabularNumerals = false;  ///< tabular numerals (reference: font-variant-numeric:tabular-nums)
+    bool strikethrough = false;    ///< line through the text middle (R15): drawn by DWrite
+                                   ///< (IDWriteTextLayout::SetStrikethrough), so metrics and
+                                   ///< thickness follow the run's own font; the line takes the
+                                   ///< text color of the run. Coexists with ellipsis truncation
+                                   ///< (the line covers exactly the drawn, possibly truncated, run).
+    bool underline = false;        ///< underline (R15): same mechanism (SetUnderline) — the public
+                                   ///< counterpart of the hover underline Button draws by hand
 };
 
 /// Gradient stop (pos ranges 0..1).
@@ -816,6 +834,17 @@ public:
     /// prevents non-wrapping labels from crowding adjacent widgets).
     Label& SetEllipsis(bool e = true) { ellipsis_ = e; Invalidate(); return *this; }
 
+    /// Strikethrough (R15): a line through the text middle, in the text's own color,
+    /// drawn by DWrite with the font's own metrics (Font::strikethrough). Coexists with
+    /// ellipsis truncation — the line covers exactly the drawn (possibly truncated) run.
+    bool Strikethrough() const { return font_.strikethrough; }
+    Label& SetStrikethrough(bool on = true) { font_.strikethrough = on; Invalidate(); return *this; }
+
+    /// Underline (R15): same mechanism (Font::underline); independent of the hover
+    /// underline Button::Hyperlink draws by hand.
+    bool Underline() const { return font_.underline; }
+    Label& SetUnderline(bool on = true) { font_.underline = on; Invalidate(); return *this; }
+
 protected:
     void OnPaint(Painter& p, const Theme& theme) override;
     Size DesiredSize() const override;   // single-line text measurement (fix width/height for wrapping text)
@@ -898,8 +927,24 @@ public:
     /// Count badge for text buttons (small accent capsule right of the text, e.g. "Inbox 12").
     Button& SetBadge(int count) { badge_ = count; Relayout(); Invalidate(); return *this; }
 
-    /// Overrides the text color (e.g. error color for destructive actions); when unset, color follows the style.
-    Button& SetTextColorOverride(const Color& color) { textOverride_ = color; Invalidate(); return *this; }
+    /// Overrides the foreground color of the text — and, on IconOnly buttons, of the icon
+    /// (R16: an icon button has no text, so the override IS its content color; previously
+    /// the IconOnly branch hardcoded theme.text). The override wins over the style color
+    /// in every state (disabled included), exactly like the text branch has always done.
+    /// Pass std::nullopt / {} to clear — R16: the previous const Color& signature turned a
+    /// {} "clear" into opaque black (Color{} is opaque black, and that was what got stored).
+    /// When unset, color follows the style.
+    Button& SetTextColorOverride(std::optional<Color> color) {
+        textOverride_ = std::move(color);
+        Invalidate();
+        return *this;
+    }
+    /// Clears the text color override (same as SetTextColorOverride(std::nullopt), R16).
+    Button& ClearTextColorOverride() {
+        textOverride_.reset();
+        Invalidate();
+        return *this;
+    }
 
     /// Click callback: fires when fully pressed and released inside the button.
     std::function<void()> OnClick;
@@ -3358,6 +3403,10 @@ struct TextCache {
         // tabLayouts reuses that slot for the draw-area height and stores font.lineHeight here instead —
         // otherwise drawing the same text in the same area with a different line spacing would reuse a layout with the wrong line spacing.
         float lineSpacing = 0;
+        // R15 decoration bits baked into a cached layout: 1 = strikethrough, 2 = underline.
+        // Only the tabLayouts table ever stores non-zero here — metrics/baselines are
+        // decoration-independent (decoration adds ink, never advance/line metrics).
+        UINT32 deco = 0;
     };
     /// Non-owning lookup view: fields must map one-to-one onto MKey.
     struct MKeyView {
@@ -3368,12 +3417,13 @@ struct TextCache {
         float maxWidth;
         float lineHeight;
         float lineSpacing = 0;
+        UINT32 deco = 0;
     };
     struct MKeyHash {
         using is_transparent = void;
         static size_t Mix(std::wstring_view text, std::wstring_view family,
                           float size, UINT32 weight, float maxWidth,
-                          float lineHeight, float lineSpacing) {
+                          float lineHeight, float lineSpacing, UINT32 deco) {
             size_t h = std::hash<std::wstring_view>()(text);
             h ^= std::hash<std::wstring_view>()(family) << 1;
             h ^= std::hash<float>()(size) << 2;
@@ -3381,15 +3431,16 @@ struct TextCache {
             h ^= std::hash<float>()(maxWidth) << 3;
             h ^= std::hash<float>()(lineHeight) << 4;
             h ^= std::hash<float>()(lineSpacing) << 5;
+            h ^= deco * 0x2545F4914F6CDD1Dull;
             return h;
         }
         size_t operator()(const MKey& k) const {
             return Mix(k.text, k.family, k.size, k.weight, k.maxWidth,
-                       k.lineHeight, k.lineSpacing);
+                       k.lineHeight, k.lineSpacing, k.deco);
         }
         size_t operator()(const MKeyView& v) const {
             return Mix(v.text, v.family, v.size, v.weight, v.maxWidth,
-                       v.lineHeight, v.lineSpacing);
+                       v.lineHeight, v.lineSpacing, v.deco);
         }
     };
     struct MKeyEqual {
@@ -3397,13 +3448,13 @@ struct TextCache {
         bool operator()(const MKey& a, const MKey& b) const {
             return a.maxWidth == b.maxWidth && a.size == b.size &&
                    a.weight == b.weight && a.lineHeight == b.lineHeight &&
-                   a.lineSpacing == b.lineSpacing &&
+                   a.lineSpacing == b.lineSpacing && a.deco == b.deco &&
                    a.family == b.family && a.text == b.text;
         }
         bool operator()(const MKey& a, const MKeyView& b) const {
             return a.maxWidth == b.maxWidth && a.size == b.size &&
                    a.weight == b.weight && a.lineHeight == b.lineHeight &&
-                   a.lineSpacing == b.lineSpacing &&
+                   a.lineSpacing == b.lineSpacing && a.deco == b.deco &&
                    std::wstring_view(a.family) == b.family &&
                    std::wstring_view(a.text) == b.text;
         }
@@ -3413,10 +3464,13 @@ struct TextCache {
     };
     std::unordered_map<MKey, DWRITE_TEXT_METRICS, MKeyHash, MKeyEqual> metrics;
     std::unordered_map<MKey, float, MKeyHash, MKeyEqual> baselines;   // first-line baseline (R25-06)
-    /// TextLayout cache for tabular numerals (tabularNumerals) (P-02): the key's
-    /// maxWidth/lineHeight slots are reused as draw-area w/h; font.lineHeight is stored
-    /// in the lineSpacing slot (GAP50-03: line spacing is baked into the format, so it must enter the key). On capacity
-    /// overrun the whole cache is cleared (use sites are small sets like slider/progress values; normally far below the cap).
+    /// TextLayout cache for tabular numerals (tabularNumerals) and decorated text
+    /// (Font::strikethrough / underline, R15): the key's maxWidth/lineHeight slots are
+    /// reused as draw-area w/h; font.lineHeight is stored in the lineSpacing slot (GAP50-03:
+    /// line spacing is baked into the format, so it must enter the key); the decoration bits
+    /// go in deco (a decorated layout must never be reused for undecorated text or vice versa).
+    /// On capacity overrun the whole cache is cleared (use sites are small sets like
+    /// slider/progress values; normally far below the cap).
     std::unordered_map<MKey, ComPtr<IDWriteTextLayout>, MKeyHash, MKeyEqual>
         tabLayouts;
     static constexpr size_t kMetricsCap = 16384;
@@ -4415,18 +4469,23 @@ public:
         DWRITE_WORD_WRAPPING ww = wrap ? DWRITE_WORD_WRAPPING_WRAP
                                        : DWRITE_WORD_WRAPPING_NO_WRAP;
         brush_->SetColor(detail::ToD2D(color));
-        if (font.tabularNumerals && g_dwrite && !text.empty()) {
-            // Tabular numerals (baseline font-variant-numeric:tabular-nums): requires
-            // enabling the OpenType feature per character via TextLayout + Typography. Layouts are cached by
-            // (text,font,drawing area) for reuse (P-02: slider drags / progress animation would rebuild per frame);
+        if ((font.tabularNumerals || font.strikethrough || font.underline) &&
+            g_dwrite && !text.empty()) {
+            // Tabular numerals (baseline font-variant-numeric:tabular-nums) and text
+            // decorations (R15 strikethrough/underline, drawn by DWrite with the run font's
+            // own metrics) both require a TextLayout instead of the shared-format DrawTextW
+            // path. Layouts are cached by (text,font,drawing area,decoration) for reuse
+            // (P-02: slider drags / progress animation would rebuild per frame);
             // alignment/wrapping state is cheap and re-set before each draw.
             auto& cache = detail::TextCacheInstance();
             const std::wstring& resolved = detail::ResolveFontFamily(detail::EffectiveFontFamily(font.family));
+            const UINT32 deco = (font.strikethrough ? 1u : 0u) |
+                                (font.underline ? 2u : 0u);
             detail::TextCache::MKeyView tkey{
                 text, resolved, font.size,
                 static_cast<UINT32>(detail::ToDWrite(font.weight)),
                 std::max(0.0f, area.w), std::max(0.0f, area.h),
-                font.lineHeight };
+                font.lineHeight, deco };
             IDWriteTextLayout* layout = nullptr;
             if (auto it = cache.tabLayouts.find(tkey);
                 it != cache.tabLayouts.end()) {
@@ -4437,22 +4496,32 @@ public:
                         text.data(), static_cast<UINT32>(text.size()), format,
                         std::max(0.0f, area.w), std::max(0.0f, area.h),
                         fresh.GetAddressOf()))) {
-                    detail::ComPtr<IDWriteTypography> tp;
-                    if (SUCCEEDED(g_dwrite->CreateTypography(tp.GetAddressOf()))) {
-                        DWRITE_FONT_FEATURE feat{
-                            DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, 1 };
-                        tp->AddFontFeature(feat);
-                        fresh->SetTypography(
-                            tp.Get(),
-                            DWRITE_TEXT_RANGE{ 0, static_cast<UINT32>(text.size()) });
+                    if (font.tabularNumerals) {
+                        detail::ComPtr<IDWriteTypography> tp;
+                        if (SUCCEEDED(g_dwrite->CreateTypography(tp.GetAddressOf()))) {
+                            DWRITE_FONT_FEATURE feat{
+                                DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, 1 };
+                            tp->AddFontFeature(feat);
+                            fresh->SetTypography(
+                                tp.Get(),
+                                DWRITE_TEXT_RANGE{ 0, static_cast<UINT32>(text.size()) });
+                        }
                     }
+                    // R15: the decoration is baked into the cached layout over the whole
+                    // run — position/thickness come from the font's own metrics, the line
+                    // takes this draw's text color (brush), ellipsis-safe (Label draws the
+                    // truncated string, so the line covers exactly the drawn run).
+                    const DWRITE_TEXT_RANGE full{
+                        0, static_cast<UINT32>(text.size()) };
+                    if (font.strikethrough) fresh->SetStrikethrough(true, full);
+                    if (font.underline) fresh->SetUnderline(true, full);
                     if (cache.tabLayouts.size() >= 256) cache.tabLayouts.clear();
                     auto ins = cache.tabLayouts.emplace(
                         detail::TextCache::MKey{
                             std::wstring(text), resolved, font.size,
                             static_cast<UINT32>(detail::ToDWrite(font.weight)),
                             std::max(0.0f, area.w), std::max(0.0f, area.h),
-                            font.lineHeight },
+                            font.lineHeight, deco },
                         std::move(fresh));
                     layout = ins.first->second.Get();
                 }
@@ -9133,6 +9202,10 @@ void Button::OnPaint(Painter& p, const Theme& theme) {
                               pressed_ ? theme.subtleActive : theme.hoverSoft);
         if (!icon_.IsEmpty()) {
             Color fg = disabled ? theme.textDisabled : theme.text;
+            // R16: the override is the content foreground color — an IconOnly button has
+            // no text, so here it colors the icon (previously hardcoded theme.text and
+            // unreachable from the text branch's override application below).
+            if (textOverride_) fg = *textOverride_;
             // icon centered at the widget size (36px+ uses a 20px icon, otherwise 16px;
             // SetIconSize overrides the auto choice, I-04)
             float s = iconSize_ > 0.0f ? iconSize_
@@ -9167,7 +9240,10 @@ void Button::OnPaint(Painter& p, const Theme& theme) {
         textArea = { start, bounds_.y, textW, bounds_.h };
         badgeRect = { start + textW + 8.0f, bounds_.y + (bounds_.h - 17.0f) / 2.0f, bw, 17 };
     } else if (!icon_.IsEmpty()) {
-        float group = 16.0f + 8.0f + textW;
+        // icon 16 + gap 8 + text: the 8px gap belongs BETWEEN icon and text, so an empty
+        // text must not keep it — center the bare 16px icon instead of a "16+8+0" group
+        // whose icon sat 4px left of the box center (R16).
+        float group = text_.empty() ? 16.0f : 16.0f + 8.0f + textW;
         float start = bounds_.x + (bounds_.w - group) * 0.5f;
         iconArea = { start, bounds_.y + (bounds_.h - 16.0f) / 2.0f, 16, 16 };
         textArea = { start + 24.0f, bounds_.y, textW, bounds_.h };
