@@ -195,10 +195,23 @@
 /// the floor keeps scrolling (contentH_ follows the same measured size, so the bar and
 /// wheel only engage on real overflow). Fixed height keeps priority; 0 = unset and every
 /// existing path measures, lays out and renders exactly as before.
+/// 0.58.0 = consumer-requirement round 14 (round-77): R24 — real program icons (multi-color
+/// bitmaps) enter the widget tree. Icon::FromPixels(w, h, stride, format, pixels) copies
+/// raw BGRA8 pixels into an icon (premultiplied natively; straight alpha is converted once
+/// inside the call), and Icon::FromHICON decodes a shell HICON at its native size (alpha
+/// from the 32-bit color bitmap, else derived from the AND mask). A raster icon flows
+/// through the existing DrawIcon path into every icon slot (Label, Button incl. IconOnly,
+/// menu/flyout items, the title-bar badge) with its own colors — the tint argument is
+/// ignored on the raster branch — scaled uniformly to fit and centered, with high-quality
+/// cubic filtering when downscaling; the D2D bitmap is cached per render-target context
+/// inside the icon data. Window::SetIcon(const Icon&, const Color&) accepts raster
+/// sources: the bake scales the pixels into both system tiers (a tint does not apply).
+/// Empty/invalid input yields an empty icon and every slot keeps its existing fallback;
+/// with no raster icon anywhere, all rendering is byte-identical to 0.57.0.
 #define SLENDER_UI_VERSION_MAJOR 0
-#define SLENDER_UI_VERSION_MINOR 57
+#define SLENDER_UI_VERSION_MINOR 58
 #define SLENDER_UI_VERSION_PATCH 0
-#define SLENDER_UI_VERSION "0.57.0"
+#define SLENDER_UI_VERSION "0.58.0"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
@@ -330,13 +343,35 @@ struct GradientStop {
 // Icons
 // ---------------------------------------------------------------------------
 
-/// Vector icon: SVG path data on a 24×24 viewbox, rasterized on demand into D2D path geometry and
-/// rendered with a solid-color fill (icon objects are copyable; geometry is globally shared and cached).
+/// Pixel layout for Icon::FromPixels (R24). Rows are top-down; the byte distance between
+/// row starts is given by the `stride` argument (pass 4×width for a tightly packed buffer).
+enum class IconPixelFormat {
+    Bgra8Premultiplied,    ///< D2D-native premultiplied BGRA (each channel pre-scaled by alpha)
+    Bgra8Unpremultiplied,  ///< straight-alpha BGRA; converted to premultiplied once inside the call
+};
+
+/// Icon: an SVG path on a 24×24 viewbox rasterized on demand into D2D path geometry and
+/// rendered with a solid-color fill — or, since R24, a multi-color raster image (a real
+/// program icon): raster content draws with its own stored colors and is never tinted.
+/// Icon objects are copyable; the payload (geometry or pixels) is shared and cached.
 class Icon {
 public:
     /// Constructs from the d attribute content of an SVG path (supports M/L/H/V/C/S/Q/T/A/Z commands,
     /// absolute and relative coordinates). Yields an empty icon on parse failure.
     static Icon FromSvgPath(std::string_view pathData);
+
+    /// R24: constructs from raw 32-bit BGRA pixels (top-down rows). The buffer is copied
+    /// inside the call; the caller may free it immediately afterwards. A null buffer,
+    /// non-positive extents, or a stride smaller than 4×width yields an empty icon.
+    static Icon FromPixels(int width, int height, int stride,
+                           IconPixelFormat format, const void* pixels);
+
+    /// R24: decodes an HICON into a raster icon at the icon's native size (real program
+    /// icons from the shell, e.g. via SHGetFileInfoW / SHGFI_ICON). The 32-bit color
+    /// bitmap is taken premultiplied as-is; when it carries no alpha the AND mask
+    /// supplies it (a mask-only icon decodes to black/white). The handle stays owned by
+    /// the caller; a null handle or a failed decode yields an empty icon.
+    static Icon FromHICON(HICON icon);
 
     Icon();
     ~Icon();
@@ -346,6 +381,8 @@ public:
     Icon& operator=(Icon&&) noexcept;
 
     bool IsEmpty() const;
+    /// R24: true when this icon carries raster pixels (drawn untinted) rather than a path.
+    bool IsRaster() const;
 
 private:
     friend class RenderPainter;
@@ -2938,6 +2975,8 @@ public:
     /// not retained beyond the bake. An empty icon restores the library default (letter
     /// badge), same as SetIcon(nullptr, nullptr). The title-bar badge is a separate surface —
     /// pair with TitleBar::SetBadgeIcon. Requires a created window (like the HICON overload).
+    /// R24: a raster icon source bakes the same way but the tint does not apply — the
+    /// pixels carry their own colors and are scaled into both tiers as-is.
     Window& SetIcon(const Icon& icon, const Color& tint);
 
     /// Adds a widget, returns the reference (the window owns the widget).
@@ -3272,6 +3311,15 @@ public:
     T* operator->() const { return ptr_; }
     explicit operator bool() const { return ptr_ != nullptr; }
     T** GetAddressOf() { Reset(); return &ptr_; }
+    /// Adopts a raw pointer that is already referenced elsewhere, taking an extra
+    /// reference of its own (R24: the raster draw cache must hold a strong ref to the
+    /// render-target context a bitmap was built on, so the context's address can never
+    /// be reused while the cache entry lives).
+    void Assign(T* p) {
+        Reset();
+        ptr_ = p;
+        if (ptr_) ptr_->AddRef();
+    }
     void Reset() {
         if (ptr_) { ptr_->Release(); ptr_ = nullptr; }
     }
@@ -3836,6 +3884,29 @@ struct IconData {
     bool tried = false;
     ComPtr<ID2D1PathGeometry> geometry;
 
+    // R24: raster content (Icon::FromPixels / Icon::FromHICON) — premultiplied BGRA8,
+    // top-down, compacted to rasterW*4 bytes per row at construction. A raster icon has
+    // no figures; DrawIcon and BakePathIcon branch on IsRaster() and never touch the
+    // geometry half (GetGeometry stays vector-only).
+    bool IsRaster() const { return !raster.empty(); }
+    bool HasContent() const { return !figures.empty() || IsRaster(); }
+    int rasterW = 0, rasterH = 0;
+    std::vector<uint8_t> raster;
+    // R24 draw cache: one D2D bitmap per render-target context — the same icon can be
+    // drawn by the main window and a popup within the same frame (menu/flyout items
+    // render in the popup's own context), so a single slot would thrash. Each entry
+    // holds a strong reference to the context its bitmap was built on: a destroyed
+    // context's address can therefore never be reused while the entry lives, and a map
+    // hit is always a same-object, same-device hit (no stale cross-device bitmap — the
+    // failure mode SetFrame's ctx-change invalidation guards against for gradients).
+    // Entries die with the icon; Shutdown additionally sweeps them via Live().
+    struct RasterDraw {
+        ComPtr<ID2D1DeviceContext> owner;
+        ComPtr<ID2D1Bitmap> bmp;
+        ComPtr<ID2D1BitmapBrush1> brush;   // interpolation mode is set per draw
+    };
+    std::unordered_map<void*, RasterDraw> rasterDraws;
+
     // ARCH38-02: live icon-data registry — function-local static Icons (title-bar buttons / tree arrows /
     // stars etc.) hold geometry created from the g_d2d factory; static destruction runs after Shutdown's g_d2d.Reset,
     // so they must register here and be released proactively by Shutdown. Weak refs: IconData dies with its last user
@@ -3868,6 +3939,120 @@ struct IconData {
         return geometry.Get();
     }
 };
+
+/// ARCH38-02 registration shared by all icon constructors: registers live icon data so
+/// Shutdown can release device-side resources (path geometry, R24 raster draw caches);
+/// also prunes dead weak refs every 64 registrations.
+inline void RegisterLiveIconData(const std::shared_ptr<IconData>& d) {
+    auto& live = IconData::Live();
+    if (live.size() % 64 == 0)
+        live.erase(std::remove_if(live.begin(), live.end(),
+                                  [](const std::weak_ptr<IconData>& w) {
+                                      return w.expired();
+                                  }),
+                   live.end());
+    live.emplace_back(d);
+}
+
+/// R24: decodes an HICON into `out`'s premultiplied BGRA raster at the icon's native
+/// size. The color bitmap of a 32-bit icon is already premultiplied (the same format
+/// the DC-RT bake pipeline writes and DrawBitmap consumes — this is the in-memory icon
+/// convention, e.g. what gfx::IconUtil-class decoders rely on); when every alpha byte
+/// is zero the alpha is derived from the AND mask (bit 1 = transparent; RGB is zeroed
+/// there to keep the premultiplied form clean). A mask-only (monochrome) icon decodes
+/// to black/white from its AND+XOR mask halves. GetDIBits converts any source depth to
+/// 32bpp top-down. Returns false on a null handle or a failed decode; the input handle
+/// stays owned by the caller (only GetIconInfo's temporary bitmaps die here).
+inline bool DecodeHiconPixels(HICON icon, IconData& out) {
+    if (!icon) return false;
+    ICONINFO ii{};
+    if (!GetIconInfo(icon, &ii)) return false;
+    bool mono = ii.hbmColor == nullptr;
+    int w = 0, h = 0;
+    std::vector<uint8_t> color;   // 32bpp top-down BGRA
+    std::vector<uint8_t> mask;    // 1bpp top-down, DWORD-aligned rows
+    int maskW = 0, maskH = 0;
+    bool colorOk = false;
+    if (ii.hbmColor) {
+        BITMAP bm{};
+        if (GetObjectW(ii.hbmColor, sizeof(bm), &bm) && bm.bmWidth > 0 && bm.bmHeight > 0) {
+            w = bm.bmWidth;
+            h = std::abs(bm.bmHeight);
+            BITMAPINFO bi{};
+            bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth = w;
+            bi.bmiHeader.biHeight = -h;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            color.resize(static_cast<size_t>(w) * h * 4);
+            HDC sdc = GetDC(nullptr);
+            int got = GetDIBits(sdc, ii.hbmColor, 0, h, color.data(), &bi, DIB_RGB_COLORS);
+            ReleaseDC(nullptr, sdc);
+            colorOk = got == h;
+        }
+        DeleteObject(ii.hbmColor);
+    }
+    if (ii.hbmMask) {
+        BITMAP bm{};
+        if (GetObjectW(ii.hbmMask, sizeof(bm), &bm) && bm.bmWidth > 0 && bm.bmHeight > 0) {
+            maskW = bm.bmWidth;
+            maskH = bm.bmHeight;
+            struct { BITMAPINFOHEADER h; RGBQUAD c[2]; } bi{};
+            bi.h.biSize = sizeof(BITMAPINFOHEADER);
+            bi.h.biWidth = maskW;
+            bi.h.biHeight = -maskH;
+            bi.h.biPlanes = 1;
+            bi.h.biBitCount = 1;
+            bi.h.biCompression = BI_RGB;
+            mask.resize(static_cast<size_t>((maskW + 31) / 32) * 4 * maskH);
+            HDC sdc = GetDC(nullptr);
+            int got = GetDIBits(sdc, ii.hbmMask, 0, maskH, mask.data(),
+                                reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS);
+            ReleaseDC(nullptr, sdc);
+            if (got != maskH) mask.clear();
+        }
+        DeleteObject(ii.hbmMask);
+    }
+    if (!colorOk) return false;
+    auto maskBit = [&](int x, int y) {
+        return mask[static_cast<size_t>(y) * ((maskW + 31) / 32) * 4 + x / 8] &
+               (0x80u >> (x % 8));
+    };
+    bool hasAlpha = false;
+    for (size_t i = 3; i < color.size(); i += 4)
+        if (color[i]) { hasAlpha = true; break; }
+    if (hasAlpha) {   // 32-bit icon bitmaps store premultiplied BGRA — pass through
+        out.rasterW = w;
+        out.rasterH = h;
+        out.raster = std::move(color);
+        return true;
+    }
+    if (mask.empty() || maskW != w) return false;
+    // no alpha channel: the AND mask supplies it (bit 1 = transparent)
+    out.rasterW = w;
+    out.rasterH = h;
+    out.raster = std::move(color);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            uint8_t* px = &out.raster[(static_cast<size_t>(y) * w + x) * 4];
+            if (maskBit(x, y)) px[0] = px[1] = px[2] = px[3] = 0;
+            else px[3] = 255;
+        }
+    // a monochrome icon carries no color bitmap: the mask is double height and the
+    // second half is the XOR mask (bit 1 = white, bit 0 = black for the opaque pixels)
+    if (mono && maskH >= 2 * h) {
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                uint8_t* px = &out.raster[(static_cast<size_t>(y) * w + x) * 4];
+                if (px[3] == 255) {
+                    uint8_t v = maskBit(x, h + y) ? 255 : 0;
+                    px[0] = px[1] = px[2] = v;
+                }
+            }
+    }
+    return true;
+}
 
 /// SVG path d-attribute parser: all commands normalized into cubic-bezier subpaths.
 class SvgPathParser {
@@ -4194,10 +4379,14 @@ private:
 /// background (the same DC render target + DIB pipeline as MakeBadgeIcon: premultiplied BGRA,
 /// no COM/WIC anywhere). The caller owns the returned handle and must DestroyIcon it; nullptr
 /// on empty geometry, a missing device, or a failed frame (R35-01: EndDraw's result is consumed).
+/// R24: this is also the icon bake dispatcher — a raster icon bakes its own pixels scaled
+/// fit-and-center into the px box (the tint argument does not apply: multi-color content)
+/// with high-quality cubic filtering when downscaling.
 inline HICON BakePathIcon(IconData& data, int px, const Color& tint) {
-    if (px <= 0 || data.figures.empty() || !g_d2d) return nullptr;
-    ID2D1PathGeometry* geo = data.GetGeometry();
-    if (!geo) return nullptr;
+    if (px <= 0 || !g_d2d) return nullptr;
+    if (!data.IsRaster() && data.figures.empty()) return nullptr;
+    ID2D1PathGeometry* geo = data.IsRaster() ? nullptr : data.GetGeometry();
+    if (!data.IsRaster() && !geo) return nullptr;
     ComPtr<ID2D1DCRenderTarget> rt;
     D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
         D2D1_RENDER_TARGET_TYPE_SOFTWARE,
@@ -4227,14 +4416,40 @@ inline HICON BakePathIcon(IconData& data, int px, const Color& tint) {
     HRESULT hr = rt->BindDC(mem, &rc);
     if (SUCCEEDED(hr)) {
         rt->BeginDraw();
-        float scale = static_cast<float>(px) / 24.0f;
-        ComPtr<ID2D1SolidColorBrush> ink;
-        if (SUCCEEDED(rt->CreateSolidColorBrush(ToD2D(tint), ink.GetAddressOf()))) {
-            // same fit-and-center transform as RenderPainter::DrawIcon, minus the centering
-            // (the icon box is exactly the viewbox aspect here)
-            rt->SetTransform(D2D1::Matrix3x2F::Scale(D2D1::SizeF(scale, scale)));
-            rt->FillGeometry(geo, ink.Get());
-            rt->SetTransform(D2D1::Matrix3x2F::Identity());
+        if (data.IsRaster()) {
+            // R24: scale the premultiplied pixels fit-and-center into the px box (same
+            // box discipline as RenderPainter::DrawIcon); the tint does not apply. The
+            // legacy DC render target only knows linear interpolation (ID2D1BitmapBrush1
+            // is device-context-only) — at the system tiers (≈px source → px box) that
+            // is visually lossless enough for a taskbar/title-bar icon.
+            D2D1_BITMAP_PROPERTIES bprops{
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                  D2D1_ALPHA_MODE_PREMULTIPLIED),
+                96.0f, 96.0f };
+            ComPtr<ID2D1Bitmap> bmp;
+            if (SUCCEEDED(rt->CreateBitmap(
+                    D2D1::SizeU(static_cast<UINT32>(data.rasterW),
+                                static_cast<UINT32>(data.rasterH)),
+                    data.raster.data(), static_cast<UINT32>(data.rasterW) * 4,
+                    bprops, bmp.GetAddressOf()))) {
+                float scale = std::min(static_cast<float>(px) / data.rasterW,
+                                       static_cast<float>(px) / data.rasterH);
+                float w = data.rasterW * scale, h = data.rasterH * scale;
+                D2D1_RECT_F dst{ (px - w) * 0.5f, (px - h) * 0.5f,
+                                 (px + w) * 0.5f, (px + h) * 0.5f };
+                rt->DrawBitmap(bmp.Get(), dst, 1.0f,
+                               D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            }
+        } else {
+            float scale = static_cast<float>(px) / 24.0f;
+            ComPtr<ID2D1SolidColorBrush> ink;
+            if (SUCCEEDED(rt->CreateSolidColorBrush(ToD2D(tint), ink.GetAddressOf()))) {
+                // same fit transform as RenderPainter::DrawIcon (no centering: the icon
+                // box is exactly the viewbox aspect here)
+                rt->SetTransform(D2D1::Matrix3x2F::Scale(D2D1::SizeF(scale, scale)));
+                rt->FillGeometry(geo, ink.Get());
+                rt->SetTransform(D2D1::Matrix3x2F::Identity());
+            }
         }
         // R35-01: the EndDraw return value must be consumed — any drawing error inside a D2D
         // frame ⇒ drop the whole frame; without checking this HRESULT an all-zero DIB still
@@ -4266,18 +4481,56 @@ inline Icon Icon::FromSvgPath(std::string_view pathData) {
     icon.data_ = std::make_shared<detail::IconData>();
     detail::SvgPathParser parser(pathData);
     if (!parser.Parse(*icon.data_)) icon.data_->figures.clear();
-    // ARCH38-02: register live icon data so Shutdown can release device geometry; also prunes dead weak refs
-    if (icon.data_) {
-        auto& live = detail::IconData::Live();
-        if (live.size() % 64 == 0)
-            live.erase(std::remove_if(live.begin(), live.end(),
-                                      [](const std::weak_ptr<detail::IconData>& w) {
-                                          return w.expired();
-                                      }),
-                       live.end());
-        live.emplace_back(icon.data_);
-    }
+    // ARCH38-02: register live icon data so Shutdown can release device geometry
+    if (icon.data_) detail::RegisterLiveIconData(icon.data_);
     return icon;
+}
+
+inline Icon Icon::FromPixels(int width, int height, int stride,
+                             IconPixelFormat format, const void* pixels) {
+    Icon icon;
+    if (!pixels || width <= 0 || height <= 0 || stride < width * 4) return icon;
+    icon.data_ = std::make_shared<detail::IconData>();
+    icon.data_->rasterW = width;
+    icon.data_->rasterH = height;
+    icon.data_->raster.resize(static_cast<size_t>(width) * height * 4);
+    const uint8_t* src = static_cast<const uint8_t*>(pixels);
+    uint8_t* dst = icon.data_->raster.data();
+    if (format == IconPixelFormat::Bgra8Unpremultiplied) {
+        // straight alpha → premultiplied, once, at construction (D2D consumes
+        // premultiplied only; getting this wrong at the call site is the classic
+        // "dark halos on icon edges" bug the R24 report calls out)
+        for (int y = 0; y < height; ++y) {
+            const uint8_t* row = src + static_cast<size_t>(y) * stride;
+            uint8_t* out = dst + static_cast<size_t>(y) * width * 4;
+            for (int x = 0; x < width; ++x) {
+                unsigned a = row[x * 4 + 3];
+                out[x * 4 + 0] = static_cast<uint8_t>(row[x * 4 + 0] * a / 255);
+                out[x * 4 + 1] = static_cast<uint8_t>(row[x * 4 + 1] * a / 255);
+                out[x * 4 + 2] = static_cast<uint8_t>(row[x * 4 + 2] * a / 255);
+                out[x * 4 + 3] = static_cast<uint8_t>(a);
+            }
+        }
+    } else {
+        for (int y = 0; y < height; ++y)
+            std::memcpy(dst + static_cast<size_t>(y) * width * 4,
+                        src + static_cast<size_t>(y) * stride,
+                        static_cast<size_t>(width) * 4);
+    }
+    detail::RegisterLiveIconData(icon.data_);
+    return icon;
+}
+
+inline Icon Icon::FromHICON(HICON icon) {
+    Icon out;
+    if (!icon) return out;
+    out.data_ = std::make_shared<detail::IconData>();
+    if (!detail::DecodeHiconPixels(icon, *out.data_)) {
+        out.data_.reset();   // failed decode = empty icon, not a half-filled one
+        return out;
+    }
+    detail::RegisterLiveIconData(out.data_);
+    return out;
 }
 
 Icon::Icon() = default;
@@ -4286,7 +4539,8 @@ Icon::Icon(const Icon&) = default;
 Icon& Icon::operator=(const Icon&) = default;
 Icon::Icon(Icon&&) noexcept = default;
 Icon& Icon::operator=(Icon&&) noexcept = default;
-bool Icon::IsEmpty() const { return !data_ || data_->figures.empty(); }
+bool Icon::IsEmpty() const { return !data_ || !data_->HasContent(); }
+bool Icon::IsRaster() const { return data_ && data_->IsRaster(); }
 
 /// Bakes a "gradient rounded square + title first letter" badge into an HICON of the given pixel size (R34-02).
 /// Same source as TitleBar::OnPaint's owner-drawn badge: 20 DIP box / radius 6 / 12 DIP bold letter.
@@ -4720,6 +4974,9 @@ public:
 
     void DrawIcon(const Icon& icon, const Rect& area, const Color& color) override {
         if (!ctx_ || !brush_ || icon.IsEmpty()) return;
+        // R24: raster content draws its own stored colors — the tint argument is ignored
+        // on this path (multi-color content cannot be tinted without destroying it)
+        if (icon.data_->IsRaster()) { DrawRasterIcon(*icon.data_, area); return; }
         ID2D1PathGeometry* geo = icon.data_->GetGeometry();
         if (!geo) return;
         float scale = std::min(area.w, area.h) / 24.0f;
@@ -4734,6 +4991,65 @@ public:
         brush_->SetColor(detail::ToD2D(color));
         ctx_->FillGeometry(geo, brush_);
         ctx_->SetTransform(old);
+    }
+
+    // R24: pixels scale uniformly to fit the box and center (the vector path's
+    // discipline); quality is high-quality cubic when downscaling (the usual case — a
+    // shell icon lands in a 16–20 DIP box) and linear when upscaling. Drawn through a
+    // bitmap brush + FillRectangle so the draw honors the world transform, clips and
+    // opacity layers exactly like every other primitive (DeviceContext::DrawImage does
+    // not apply the world transform — the trap the shadow path already avoids; the
+    // legacy RenderTarget DrawBitmap has no high-quality-cubic mode).
+    void DrawRasterIcon(detail::IconData& data, const Rect& area) {
+        if (area.w <= 0 || area.h <= 0) return;
+        ID2D1BitmapBrush1* brush = EnsureRasterBrush(data);
+        if (!brush) return;
+        float scale = std::min(area.w / data.rasterW, area.h / data.rasterH);
+        float w = data.rasterW * scale, h = data.rasterH * scale;
+        D2D1_RECT_F dst{ area.x + (area.w - w) * 0.5f, area.y + (area.h - h) * 0.5f,
+                         area.x + (area.w + w) * 0.5f, area.y + (area.h + h) * 0.5f };
+        brush->SetInterpolationMode1(
+            scale < 1.0f ? D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
+                         : D2D1_INTERPOLATION_MODE_LINEAR);
+        // brush transform positions the bitmap IN the fill space: p = u·scale + dst.origin.
+        // D2D matrices are ROW-vector (A*B applies A first — cf. DrawIcon's
+        // Scale*Translation above), so the composite reads scale-then-translate; getting
+        // the order or the direction wrong clamp-samples a single bitmap edge column and
+        // paints a solid-color box (both first-draft mistakes, caught by this round's probe)
+        brush->SetTransform(D2D1::Matrix3x2F::Scale(D2D1::SizeF(scale, scale)) *
+                            D2D1::Matrix3x2F::Translation(dst.left, dst.top));
+        ctx_->FillRectangle(dst, brush);
+    }
+
+    ID2D1BitmapBrush1* EnsureRasterBrush(detail::IconData& data) {
+        auto it = data.rasterDraws.find(ctx_);
+        if (it != data.rasterDraws.end()) return it->second.brush.Get();
+        D2D1_BITMAP_PROPERTIES props{
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            96.0f, 96.0f };
+        detail::ComPtr<ID2D1Bitmap> bmp;
+        if (FAILED(ctx_->CreateBitmap(
+                D2D1::SizeU(static_cast<UINT32>(data.rasterW),
+                            static_cast<UINT32>(data.rasterH)),
+                data.raster.data(), static_cast<UINT32>(data.rasterW) * 4,
+                props, bmp.GetAddressOf())))
+            return nullptr;
+        D2D1_BITMAP_BRUSH_PROPERTIES1 bprops{
+            D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
+            D2D1_INTERPOLATION_MODE_LINEAR };
+        detail::ComPtr<ID2D1BitmapBrush1> brush;
+        if (FAILED(ctx_->CreateBitmapBrush(bmp.Get(), &bprops, nullptr,
+                                           brush.GetAddressOf())))
+            return nullptr;
+        // entries only accumulate with window/device churn; one flush simply re-creates
+        // the next draw (live context count is small — IconData::rasterDraws note)
+        if (data.rasterDraws.size() > 32) data.rasterDraws.clear();
+        detail::IconData::RasterDraw entry;
+        entry.owner.Assign(ctx_);
+        entry.bmp = std::move(bmp);
+        entry.brush = std::move(brush);
+        data.rasterDraws.emplace(ctx_, std::move(entry));
+        return data.rasterDraws[ctx_].brush.Get();
     }
 
     void PushClip(const Rect& rect) override {
@@ -14554,6 +14870,7 @@ void Shutdown() {
         if (auto d = w.lock()) {
             d->geometry.Reset();
             d->tried = false;
+            d->rasterDraws.clear();   // R24: device-side raster draw caches
         }
     detail::TextCacheInstance().ClearAll();
     detail::FontResolveCache().clear();
