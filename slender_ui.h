@@ -184,10 +184,21 @@
 /// restores the letter-badge default. TitleBar::SetBadgeIcon(const Icon&) replaces the
 /// badge's first-letter ink with the vector glyph (16 DIP ink box in the 20 DIP
 /// gradient square, textOnAccent tint, dimmed with the bar); empty restores the letter.
+/// 0.57.0 = consumer-requirement R23 (round-76; appended to the round-13 file after its
+/// R22 half shipped in 0.56.0): container min-height. Widget::SetMinHeight/MinHeight
+/// floor the measured height (CSS min-height): a Row/Column measures max(natural, min)
+/// on the height axis — the main axis when vertical, the cross axis when horizontal —
+/// for the container itself and for each child measured inside it, and layout allocates
+/// a hug-content child its floored size (weighted children keep the pure flex share).
+/// Inside a ScrollViewer a short content column then still fills the viewport (a weighted
+/// sibling consumes the slack, pinning a footer to the bottom) while content taller than
+/// the floor keeps scrolling (contentH_ follows the same measured size, so the bar and
+/// wheel only engage on real overflow). Fixed height keeps priority; 0 = unset and every
+/// existing path measures, lays out and renders exactly as before.
 #define SLENDER_UI_VERSION_MAJOR 0
-#define SLENDER_UI_VERSION_MINOR 56
+#define SLENDER_UI_VERSION_MINOR 57
 #define SLENDER_UI_VERSION_PATCH 0
-#define SLENDER_UI_VERSION "0.56.0"
+#define SLENDER_UI_VERSION "0.57.0"
 
 // The public API (SetIcon) needs HICON, but this header's public section does not force windows.h to be included first.
 // Forward declaration identical in shape to the Windows SDK: a legal repeated typedef when windows.h is already included.
@@ -632,9 +643,24 @@ public:
         return *this;
     }
     /// Max-width constraint: layout containers never stretch the widget beyond this width (e.g. the section 1080px cap).
-    Widget& SetMaxWidth(float w){ maxWidth_ = w; Relayout(); 
+    Widget& SetMaxWidth(float w){ maxWidth_ = w; Relayout();
         return *this;
     }
+    /// Min-height floor (R23, CSS min-height): measurement never reports less than this
+    /// height. A Row/Column measures max(natural, min) on the height axis — the main axis
+    /// when vertical, the cross axis when horizontal — both for the container itself and for
+    /// each child measured inside it, and layout allocates a hug-content child its floored
+    /// size, so inside a ScrollViewer a short content column still fills the viewport (a
+    /// weighted sibling consumes the slack, pinning a footer to the bottom) while content
+    /// taller than the floor keeps scrolling (contentH_ follows the same measured size).
+    /// Fixed height keeps priority (a fixed child or fixed container is never floored);
+    /// weight distribution, hit-testing and scrollbar geometry are untouched. 0 = unset
+    /// (the default; every existing path measures, lays out and renders exactly as before).
+    Widget& SetMinHeight(float h){ minHeight_ = h; Relayout();
+        return *this;
+    }
+    /// The configured min-height floor (0 = unset).
+    float MinHeight() const { return minHeight_; }
     /// Occupies a full row in a Flow container (reference .ex-card.wide's grid-column:1/-1).
     /// Full-row width is min(available width, maxWidth constraint) (extra-wide cards like the settings card cap at 640).
     Widget& SetFlowFullRow(bool full = true) { flowFullRow_ = full; Relayout(); return *this; }
@@ -784,6 +810,7 @@ protected:
 
     float fixedW_ = 0, fixedH_ = 0, weight_ = 0;
     float maxWidth_ = 0;   // 0 means unlimited
+    float minHeight_ = 0;   // 0 means unset (R23 min-height floor)
     bool flowFullRow_ = false;   // full row in Flow
     CrossAlign crossAlign_ = CrossAlign::Stretch;
     bool crossAlignSet_ = false;   // explicit SetCrossAlign (align-self; container does not override)
@@ -8773,8 +8800,14 @@ void Container::LayoutChildren(const Rect& area) {
         Plan p;
         p.widget = c.get();
         p.main = fixedMain > 0 ? fixedMain : (vertical_ ? d.h : d.w);
+        // R23: allocation mirrors the measurement floor — a hug-content child is never
+        // arranged smaller than its min-height (fixed children keep their fixed size,
+        // weighted children are distributed space and keep the pure flex share).
+        // Height axis only, as in DesiredSize.
+        if (vertical_ && fixedMain <= 0 && c->minHeight_ > p.main) p.main = c->minHeight_;
         p.fixedCross = vertical_ ? c->fixedW_ : c->fixedH_;
         p.desiredCross = vertical_ ? d.w : d.h;
+        if (!vertical_ && c->minHeight_ > p.desiredCross) p.desiredCross = c->minHeight_;
         p.weight = c->weight_;
         p.weighted = fixedMain <= 0 && c->weight_ > 0;
         plans.push_back(p);
@@ -8861,8 +8894,14 @@ Size Container::DesiredSize() const {
         Size d = c->DesiredSize();
         float fixedMain = vertical_ ? c->fixedH_ : c->fixedW_;
         float fixedCross = vertical_ ? c->fixedW_ : c->fixedH_;
-        main += fixedMain > 0 ? fixedMain : (vertical_ ? d.h : d.w);
+        // R23 min-height floor on the height axis only: main axis when vertical, cross
+        // axis (the row's height) when horizontal. Fixed children are never floored.
+        float childMain = fixedMain > 0 ? fixedMain : (vertical_ ? d.h : d.w);
+        if (vertical_ && fixedMain <= 0 && c->minHeight_ > childMain)
+            childMain = c->minHeight_;
+        main += childMain;
         float ch = fixedCross > 0 ? fixedCross : (vertical_ ? d.w : d.h);
+        if (!vertical_ && fixedCross <= 0 && c->minHeight_ > ch) ch = c->minHeight_;
         cross = std::max(cross, ch);
         if (!vertical_ && c->EffectiveCrossAlign(childCrossAlignSet_, childCrossAlign_)
                 == CrossAlign::Baseline)
@@ -8879,6 +8918,13 @@ Size Container::DesiredSize() const {
     // The two axes used to be swapped for horizontal containers (Row) — vertical padding leaked out of the height, horizontal padding was added into it (L-01)
     main  += vertical_ ? (padT_ + padB_) : (padL_ + padR_);
     cross += vertical_ ? (padL_ + padR_) : (padT_ + padB_);
+    // R23: the container's own min-height floor, after padding — the height axis again
+    // (main when vertical, cross when horizontal). A fixed size on this axis is applied
+    // by the parent before this value is ever read, so fixed keeps priority.
+    if (minHeight_ > 0) {
+        if (vertical_) main = std::max(main, minHeight_);
+        else cross = std::max(cross, minHeight_);
+    }
     return vertical_ ? Size{ cross, main } : Size{ main, cross };
 }
 
